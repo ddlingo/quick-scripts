@@ -1,105 +1,44 @@
-variable "account_id" {
-  type        = string
-  description = "Account ID for the environment"
+account_id  = "753386176131"
+build_user  = "C5401446"
+
+business = {
+  name      = "sms"
+  formatted = "SMS"
+  friendly  = "Shared Management Services"
 }
 
-variable "build_user" {
-  type        = string
-  description = "User or system initiating the build"
+customer = {
+  name = "build-sms"
 }
 
-variable "business" {
-  type = object({
-    name      = string
-    formatted = string
-    friendly  = string
-  })
-  description = "Business context object"
+include_customer_label = true
+environment           = "training"
+
+organization = {
+  name      = "sap"
+  formatted = "SAP"
+  friendly  = "SAP"
 }
 
-variable "customer" {
-  type = object({
-    name = string
-  })
-  description = "Customer information object"
-}
+label_order = [
+  "security_boundary",
+  "business"
+]
 
-variable "include_customer_label" {
-  type        = bool
-  description = "Include the customer label in resource tags/labels"
-}
+owner       = "deadri.lingo@sap.com"
+partition   = "aws"
+region      = "us-east-2"
+root_module = "training-module"
 
-variable "environment" {
-  type        = string
-  description = "Deployment environment name"
-}
-
-variable "organization" {
-  type = object({
-    name      = string
-    formatted = string
-    friendly  = string
-  })
-  description = "Organization context object"
-}
-
-variable "label_order" {
-  type        = list(string)
-  description = "Order in which labels are applied"
-}
-
-variable "owner" {
-  type        = string
-  description = "Owner of the deployment"
-}
-
-variable "partition" {
-  type        = string
-  description = "Partition (e.g., 'aws', 'openstack')"
-}
-
-variable "region" {
-  type        = string
-  description = "Region for resource deployment"
-}
-
-variable "root_module" {
-  type        = string
-  description = "Name of the root module"
-}
-
-variable "security_boundary" {
-  type = object({
-    name      = string
-    formatted = string
-    friendly  = string
-  })
-  description = "Security boundary context"
+security_boundary = {
+  name      = "dev"
+  formatted = "Dev"
+  friendly  = "Development"
 }
 
 # Existing networking variables
-
-variable "network_name" {
-  type        = string
-  description = "Name of the OpenStack network"
-}
-
-variable "subnet_name" {
-  type        = string
-  description = "Name of the OpenStack subnet"
-}
-
-variable "cidr" {
-  type        = string
-  description = "CIDR block for the subnet"
-}
-
-variable "gateway_ip" {
-  type        = string
-  description = "Gateway IP for the subnet"
-}
-
-variable "dns_nameservers" {
-  type        = list(string)
-  description = "List of DNS nameservers"
-}
+network_name    = "my-vpc"
+subnet_name     = "my-subnet"
+cidr            = "10.0.0.0/24"
+gateway_ip      = "10.0.0.1"
+dns_nameservers = ["8.8.8.8", "8.8.4.4"]
