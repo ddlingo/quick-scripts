@@ -1,0 +1,95 @@
+```markdown
+# Identity and Role Relationship Flow: AWS, SAP SCI (OpenStack), Keycloak, SAML, and Active Directory
+
+## 1. Introduction
+Modern enterprise cloud deployments frequently involve multiple identity providers and federated authentication layers. In a hybrid architecture that spans **AWS**, **SAP Cloud Infrastructure (SCI, based on OpenStack)**, and **enterprise Active Directory (AD)**, authentication and authorization are managed using **federated identity providers** like **Keycloak**, which leverages **SAML 2.0** or **OIDC** protocols.
+
+This document explains the **role relationships** and **authentication flow** across these systems, focusing on how user identities and roles flow from AD through Keycloak into AWS and SCI/OpenStack.
+
+---
+
+## 2. Components
+- **Active Directory (AD)**  
+  - The source of truth for user accounts and groups.  
+  - Users authenticate using their corporate credentials.  
+
+- **Keycloak**  
+  - Acts as the **Identity Provider (IdP)**.  
+  - Federates with AD using LDAP or Kerberos.  
+  - Provides **SAML/OIDC tokens** to cloud services.  
+  - Maps AD groups to Keycloak roles/claims.  
+
+- **SAP SCI (OpenStack)**  
+  - Uses **Keystone** (the Identity Service).  
+  - Keystone trusts Keycloak as an external IdP.  
+  - Keystone roles (such as `admin`, `member`, `reader`) govern access to projects, domains, and system resources.  
+
+- **AWS**  
+  - Utilizes IAM and STS (Security Token Service).  
+  - AWS can trust SAML IdPs (like Keycloak).  
+  - Maps **SAML assertions** to IAM roles.  
+
+---
+
+## 3. Authentication Flow
+1. **User Initiates Login**  
+   - The user opens either the AWS console or the SCI (OpenStack Horizon).  
+   - The service redirects the user to **Keycloak** as the IdP.  
+
+2. **Keycloak → AD Authentication**  
+   - Keycloak redirects the user to AD (via LDAP/Kerberos) for credential validation.  
+   - AD validates the username and password (or multi-factor authentication if configured).  
+
+3. **Keycloak Issues Token**  
+   - Once authenticated, Keycloak generates a **SAML/OIDC assertion**.  
+   - This assertion contains user identity, group membership, and mapped roles.  
+
+4. **For SCI (OpenStack Keystone)**  
+   - Keystone receives the SAML assertion.  
+   - Keystone maps the user's AD groups (from Keycloak) to Keystone roles (e.g., `admin`, `member`) via mapping rules.  
+   - Keystone enforces authorization at the **project/domain level**.  
+
+5. **For AWS (IAM via SAML)**  
+   - AWS STS receives the SAML assertion from Keycloak.  
+   - The SAML assertion specifies which IAM roles the user can assume.  
+   - The user is granted temporary AWS credentials for the specified IAM role.  
+
+---
+
+## 4. Role Relationships
+### Active Directory
+- **Users** and **Groups** are defined.  
+- Example groups include `CloudAdmins`, `DevOpsTeam`, and `FinanceUsers`.  
+
+### Keycloak
+- Maps **AD Groups → Keycloak Roles → SAML Claims**.  
+- Example mapping:  
+  - AD `CloudAdmins` → Keycloak role `SCI_Admin` → SAML claim `role=admin`.  
+  - AD `DevOpsTeam` → Keycloak role `AWS_DevOps` → SAML claim with AWS role ARN.  
+
+### OpenStack (Keystone)
+- **Projects** (tenants) and **Domains** organize resources.  
+- Roles (`admin`, `member`, `reader`) control access:  
+  - `admin` (system/domain): can create projects and assign roles.  
+  - `member`: can manage project resources.  
+  - `reader`: has read-only access.  
+- Keystone enforces access using **role assignments** derived from SAML mappings.  
+
+### AWS (IAM)
+- Roles are assumed via the SAML assertion from Keycloak.  
+- Example mapping:  
+  - AD `FinanceUsers` group → Keycloak → SAML claim → AWS IAM Role `arn:aws:iam::123456789012:role/FinanceViewer`.  
+
+---
+
+## 5. Diagram
+![Authentication Flow Diagram](AuthFlowDiagram.png)
+
+---
+
+## 6. Key Points
+- **Authentication** is always against **AD**.  
+- **Keycloak** federates identity and issues tokens.  
+- **SCI/OpenStack** (Keystone) and **AWS IAM** enforce authorization locally based on roles mapped from AD groups.  
+- This architecture ensures **single sign-on (SSO)** and centralized **identity management** while delegating resource-level authorization to each cloud platform.
+```
