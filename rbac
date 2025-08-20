@@ -93,3 +93,717 @@ This document explains the **role relationships** and **authentication flow** ac
 - **SCI/OpenStack** (Keystone) and **AWS IAM** enforce authorization locally based on roles mapped from AD groups.  
 - This architecture ensures **single sign-on (SSO)** and centralized **identity management** while delegating resource-level authorization to each cloud platform.
 ```
+Goal & Assumptions (read first)
+
+Users live in Main AD (source of truth).
+
+New AD will host OUs and Security Groups that represent OpenStack project/role access.
+
+Keycloak federates with AD and is the SAML IdP for Keystone (SCI OpenStack).
+
+SCI Keystone uses federation mapping to translate group claims into local Keystone groups that carry role assignments on projects.
+
+Best practice for cross‑directory membership: establish a two‑way forest trust between Main AD and New AD, so New AD groups can include users (or global groups) from Main AD (Foreign Security Principals).
+If you cannot establish trust, see “Plan B (no trust)” near the end.
+
+0) Name your conventions
+
+Use a predictable pattern so Keycloak/Keystone mapping stays simple:
+
+OU structure (in New AD):
+OU=Cloud,OU=SCI,OU=Corp (example; adjust to your domain DN)
+
+Group names: SCI_{Project}_{Role} (Role ∈ Admin|Member|Reader), e.g.
+SCI_Analytics_Admin, SCI_Analytics_Member, SCI_Analytics_Reader
+
+If you have many projects, keep names short and consistent. You’ll reference these names in Keycloak and Keystone mapping rules.
+
+1) New AD: create OUs and groups
+1.1 (PowerShell) Create OUs
+
+Run on a DC (or RSAT) with the AD module:
+
+# Adjust your base DN
+$base = "DC=new,DC=corp"
+New-ADOrganizationalUnit -Name "Corp" -Path $base -ProtectedFromAccidentalDeletion $true
+New-ADOrganizationalUnit -Name "SCI"  -Path "OU=Corp,$base" -ProtectedFromAccidentalDeletion $true
+New-ADOrganizationalUnit -Name "Cloud" -Path "OU=SCI,OU=Corp,$base" -ProtectedFromAccidentalDeletion $true
+New-ADOrganizationalUnit -Name "Groups" -Path "OU=Cloud,OU=SCI,OU=Corp,$base" -ProtectedFromAccidentalDeletion $true
+
+1.2 Create Security Groups (New AD)
+
+Use Universal Security groups when crossing domains/forests; they’re safest for SAML/claims and trust scenarios.
+
+$groupsOU = "OU=Groups,OU=Cloud,OU=SCI,OU=Corp,DC=new,DC=corp"
+$project  = "Analytics"  # example project
+
+$roles = @("Admin","Member","Reader")
+foreach ($r in $roles) {
+  New-ADGroup -Name "SCI_${project}_$r" `
+    -GroupScope Universal -GroupCategory Security `
+    -Path $groupsOU -SamAccountName "SCI_${project}_$r" `
+    -Description "SCI OpenStack $project $r access"
+}
+
+
+Repeat per project or script it to read a list of projects.
+
+2) Enable cross‑forest membership (Main AD → New AD)
+
+Preferred: Establish a two‑way forest trust between Main AD and New AD.
+
+High‑level steps (AD Domains and Trusts MMC on both sides):
+
+Right‑click the forest root domain → Properties → Trusts → New Trust…
+
+Enter the opposite forest DNS name, choose Forest trust, select Two‑way, Forest‑wide authentication (or Selective if required by policy).
+
+Provide credentials as prompted on both sides; confirm name suffix routing; validate trust.
+
+Once the trust exists, you can add Main AD users or (better) Main AD Global Groups into New AD Universal groups:
+
+# Add a Main AD *group* (recommended) to a New AD group
+Add-ADGroupMember -Identity "SCI_Analytics_Admin" -Members "MAIN\GG_SCI_Analytics_Admins"
+
+
+You can also add individual users:
+
+Add-ADGroupMember -Identity "SCI_Analytics_Member" -Members "MAIN\jdoe","MAIN\asmith"
+
+
+Recommended pattern (AGUDLP):
+Users (A) → Global groups (G) in Main AD → added to Universal groups (U) in New AD → used as Domain Local (DL) in resource domain → Permissions (P) in target system. In our case, the U in New AD maps cleanly into SAML/Keycloak and then Keystone.
+
+3) Keycloak: federate ADs and expose group claims
+
+You have two workable variants:
+
+Variant A (simplest & common): Keycloak federates only New AD for groups (and reads Main AD users via trust)
+
+Because New AD groups contain Main AD identities (via trust), Keycloak only needs one LDAP user federation pointing at New AD.
+
+When a Main AD user logs in, Keycloak will resolve their membership in New AD groups (thanks to FSPs).
+
+Variant B (if no trust): Keycloak federates both directories
+
+Add two LDAP providers: one for Main AD (users), one for New AD (groups).
+
+This is trickier—group resolution across two LDAP providers is limited. Prefer trust if you can.
+
+3.1 Create LDAP User Federation (New AD)
+
+Keycloak Admin Console → User Federation → LDAP → Add:
+
+Vendor: Active Directory
+
+Connection URL: ldaps://dc1.new.corp:636 (recommend LDAPS)
+
+Bind DN / Bind Credential: (service account)
+
+Users DN: e.g. DC=new,DC=corp (or a tighter OU)
+
+Import Users: ON (or OFF with on‑demand)
+
+Edit Mode: READ_ONLY
+
+Use Truststore SPI: Only for LDAPS if your CA isn’t in Keycloak truststore
+
+Save.
+
+3.2 Add “Group LDAP Mapper” (maps AD groups → Keycloak groups)
+
+Within that LDAP provider → Mappers → Create:
+
+Mapper Type: group-ldap-mapper
+
+LDAP Groups DN: OU=Groups,OU=Cloud,OU=SCI,OU=Corp,DC=new,DC=corp
+
+Group Name LDAP Attribute: cn
+
+LDAP Filter (optional): (objectClass=group)
+
+Membership LDAP Attribute: member
+
+Membership Attribute Type: DN
+
+User LDAP Attribute: sAMAccountName
+
+Mode: READ_ONLY
+
+Drop non-existing groups during sync: OFF (usually)
+
+Save → Synchronize changed users (or Sync all users).
+
+3.3 Expose groups in SAML assertion to Keystone
+
+Configure your Keystone (and/or Horizon) SAML client in Keycloak:
+
+Client Protocol: saml
+
+Force NameID Format: email or persistent (your preference)
+
+Add Protocol Mapper:
+
+Mapper Type: Group list
+
+Name: groups
+
+Friendly Name: groups
+
+SAML Attribute Name: groups
+
+SAML Attribute NameFormat: Basic
+
+Single Group Attribute: OFF (so it sends multi‑valued “groups”)
+
+Result: assertion contains groups=[SCI_Analytics_Admin, SCI_Analytics_Member, …]
+
+4) Keystone (SCI): create local groups, roles, and mapping
+
+You’ll let Keystone translate SAML groups → local Keystone groups, and those local groups will hold role assignments on projects.
+
+4.1 In Keystone: create the roles (if not already)
+openstack role create admin
+openstack role create member
+openstack role create reader
+
+4.2 Create projects (tenants) as needed
+openstack project create Analytics --domain Default
+
+4.3 Create local Keystone groups (mirror your AD group names or use a clean mapping)
+openstack group create SCI_Analytics_Admin
+openstack group create SCI_Analytics_Member
+openstack group create SCI_Analytics_Reader
+
+4.4 Grant role assignments to those Keystone groups
+openstack role add --group SCI_Analytics_Admin  --project Analytics admin
+openstack role add --group SCI_Analytics_Member --project Analytics member
+openstack role add --group SCI_Analytics_Reader --project Analytics reader
+
+4.5 Register Keycloak as an Identity Provider in Keystone
+
+Get the Keycloak SAML entityID from the Keycloak client (or IdP metadata).
+
+# Create IdP (replace values)
+openstack identity provider create keycloak \
+  --remote-id "https://keycloak.new.corp/auth/realms/SCI" \
+  --enabled
+
+4.6 Create a mapping that turns SAML group names → Keystone groups
+
+Create keycloak_sci_mapping.json:
+
+{
+  "rules": [
+    {
+      "local": [ { "group": { "name": "SCI_Analytics_Admin" } } ],
+      "remote": [ { "type": "groups", "any_one_of": ["SCI_Analytics_Admin"] } ]
+    },
+    {
+      "local": [ { "group": { "name": "SCI_Analytics_Member" } } ],
+      "remote": [ { "type": "groups", "any_one_of": ["SCI_Analytics_Member"] } ]
+    },
+    {
+      "local": [ { "group": { "name": "SCI_Analytics_Reader" } } ],
+      "remote": [ { "type": "groups", "any_one_of": ["SCI_Analytics_Reader"] } ]
+    }
+  ]
+}
+
+
+Apply it:
+
+openstack mapping create keycloak_sci_mapping --rules keycloak_sci_mapping.json
+
+4.7 Bind the SAML protocol to the IdP with your mapping
+openstack federation protocol create saml \
+  --identity-provider keycloak \
+  --mapping keycloak_sci_mapping
+
+
+Now, when a user SSO’s via Keycloak, if their SAML “groups” contains SCI_Analytics_Admin, Keystone automatically adds them to local group SCI_Analytics_Admin, which already has the admin role on Analytics project.
+
+5) Test end‑to‑end
+
+Add a Main AD test user (or Main AD global group) into New AD group SCI_Analytics_Member.
+
+Keycloak: Run a “Sync changed users” on the LDAP provider (or wait for on‑demand).
+
+Login to SCI Horizon → choose the Keycloak/SSO path.
+
+In Keystone, verify the role assignment:
+
+# After the first login, Keystone creates a "shadow user" (federated)
+openstack role assignment list --user <shadow-username> --names --effective
+
+
+You should see member on Analytics.
+
+If it fails:
+
+In Keycloak, inspect the SAML assertion (use SAML tracer/browser plugin) and confirm a multi‑valued groups attribute with the expected names.
+
+In Keystone, enable debug logs for federation and check mapping hits/misses.
+
+Confirm spelling matches (group names are case‑sensitive in mapping).
+
+Plan B (no AD trust available)
+
+If you cannot establish a trust between Main AD and New AD:
+
+Option 1: Use Keycloak with two LDAP providers and keep groups in New AD:
+
+Users from Main AD authenticate.
+
+Keycloak will not natively “join” groups from a separate LDAP provider to those users.
+
+Workaround: create Keycloak realm groups (not LDAP groups) and use automation (Keycloak Admin API) to add users to those realm groups based on a lookup from New AD. (This adds ongoing sync complexity.)
+
+Option 2: Mirror/sync a subset of users into New AD (ADMT/DirSync) so that group memberships and users co‑exist in the same directory (simplifies Keycloak mappers).
+
+In practice, a two‑way trust is the cleanest and least brittle solution.
+
+Quick checklist you can reuse
+
+ New AD OUs created (…/OU=Groups,OU=Cloud,OU=SCI,OU=Corp)
+
+ New AD Universal Security Groups created per project/role
+
+ Two‑way forest trust (Main AD ↔ New AD) validated
+
+ Main AD users or (preferably) global groups added to New AD groups
+
+ Keycloak LDAP federation to New AD added (LDAPS, read‑only)
+
+ Keycloak Group LDAP Mapper points to New AD Groups OU
+
+ Keycloak SAML client for Keystone includes Group list mapper → groups
+
+ Keystone local groups mirror AD group names (or mapped 1:1)
+
+ Keystone roles granted to those groups on projects
+
+ Keystone IdP, mapping, and SAML protocol created
+
+ Test SSO → verify role assignment in Keystone
+
+If you want, I can package this into a ready‑to‑run script bundle (AD PowerShell + Keystone CLI + a Keycloak JSON export template) with your exact domain DNs, project names, and group list.
+
+You said:
+Can you point to keycloak documentation that refers to this?
+Because New AD groups contain Main AD identities (via trust), Keycloak only needs one LDAP user federation pointing at New AD.
+
+When a Main AD user logs in, Keycloak will resolve their membership in New AD groups (thanks to FSPs).
+ChatGPT said:
+
+Here's what I found regarding how Keycloak handles group membership when AD trusts are involved—specifically, how Keycloak can resolve group membership in New AD even when that group contains Main AD users via a trust.
+
+Keycloak Documentation on LDAP/AD Federation & Group Mapping
+1. LDAP/AD Federation + Group Mapper
+
+The Keycloak Server Administration Guide confirms that Keycloak supports integrating with LDAP/Active Directory for user and group federation:
+
+“Group mapper can be used to map LDAP groups from a particular branch of an LDAP tree into groups in Keycloak. It will also propagate user‑group mappings from LDAP into user‑group mappings in Keycloak.”
+
+keycloak.org
++7
+wjw465150.gitbooks.io
++7
+docs.redhat.com
++7
+cloud.google.com
++4
+keycloak.org
++4
+docs.redhat.com
++4
+
+In other words, if Keycloak has a user federation provider pointing at New AD, and that New AD group contains an FSP pointing to Main AD users (because of a cross-forest trust), then Keycloak's LDAP lookup will retrieve the group members—including the trusted Main AD users—and map them accordingly.
+
+2. Behavior with Foreign Security Principals (FSPs)
+
+While Keycloak's documentation doesn’t explicitly call out "ForeignSecurityPrincipals," LDAP inherently resolves those FSP objects when performing group membership checks via a trusted AD forest. That means when Keycloak queries member attributes of New AD groups, it receives the DNs (including FSPs), and uses those to resolve the actual user identities—your Main AD users—so they appear in group mappings.
+
+This is standard LDAP behavior with cross-forest trusts and universal group replication; Keycloak leverages LDAP search to collect and propagate those memberships.
+
+Summary
+
+Keycloak's LDAP User Federation can map AD groups and import their memberships into Keycloak realm groups.
+
+Because of the cross-forest trust, New AD groups can contain Main AD users via Foreign Security Principals.
+
+When Keycloak queries group membership via LDAP, those FSPs resolve—and Keycloak will correctly associate those Main AD users with the appropriate Keycloak groups.
+
+Although Keycloak documentation doesn’t explicitly mention “FSP” handling, this behavior flows from standard Active Directory trust and LDAP features, combined with Keycloak’s group mapper functionality.
+
+Let me know if you'd like me to track down examples or deeper AD trust-specific docs!
+
+You said:
+Please explain these steps in detail
+New AD Universal Security Groups created per project/role - So the security group needs to be created in AD first?
+
+ Two‑way forest trust (Main AD ↔ New AD) validated - 
+
+ Main AD users or (preferably) global groups added to New AD groups - 
+
+ Keycloak LDAP federation to New AD added (LDAPS, read‑only)
+
+ Keycloak Group LDAP Mapper points to New AD Groups OU 
+
+ Keycloak SAML client for Keystone includes Group list mapper → groups
+
+ Keystone local groups mirror AD group names (or mapped 1:1) - We need to create groups in Keystone, then map them to AD groups? Do we do this with policies? 
+
+ Keystone roles granted to those groups on projects
+
+ Keystone IdP, mapping, and SAML protocol created
+ChatGPT said:
+Thought for 43s
+
+Perfect—here’s each step unpacked with the why, how, and what to verify. I’ll keep it practical with GUI paths, PowerShell, and the exact Keycloak/Keystone objects to touch.
+
+1) New AD Universal Security Groups created per project/role
+
+So the security group needs to be created in AD first? — Yes. Create them in New AD so they can contain members from Main AD via the trust.
+
+Why
+
+Universal scope travels cleanly across forests and works well with SAML/claims.
+
+You’ll map these AD groups → Keycloak groups/claims → Keystone groups.
+
+How (PowerShell)
+
+# Adjust base DN and OU path to your New AD
+$baseOU = "OU=Groups,OU=Cloud,OU=SCI,OU=Corp,DC=new,DC=corp"
+$project = "Analytics"
+$roles   = @("Admin","Member","Reader")
+
+foreach ($r in $roles) {
+  New-ADGroup -Name "SCI_${project}_$r" `
+    -SamAccountName "SCI_${project}_$r" `
+    -GroupScope Universal -GroupCategory Security `
+    -Path $baseOU `
+    -Description "SCI OpenStack $project $r access"
+}
+
+
+Verify
+
+In AD Users and Computers (on New AD), confirm the groups exist under your Groups OU.
+
+Scope = Universal, Category = Security.
+
+Pitfalls
+
+Don’t use Domain Local scope if you’ll include cross‑forest members.
+
+Stick to stable names (you’ll reuse them in Keycloak/Keystone mapping).
+
+2) Two‑way forest trust (Main AD ↔ New AD) validated
+
+Why
+
+Lets New AD groups include Main AD users or Global groups as members (via FSPs).
+
+Makes group membership resolvable during LDAP lookups from New AD.
+
+How (GUI)
+
+On each forest root domain: Active Directory Domains and Trusts → right‑click domain → Properties → Trusts → New Trust…
+
+Trust type: Forest trust
+
+Direction: Two‑way
+
+Authentication: Forest‑wide (or Selective if policy requires)
+
+Complete wizard on both sides.
+
+Verify
+
+In Domains and Trusts, trust shows as Established both ways.
+
+Optional: nltest /dsgetdc:NEW.CORP from Main AD and vice versa.
+
+Check Name Suffix Routing and SID Filtering as required by policy.
+
+Pitfalls
+
+If SID filtering blocks membership resolution, group lookups may not return what you expect. Coordinate with AD admins if you need SID history across the trust.
+
+3) Main AD users / Global groups added to New AD groups
+
+Why
+
+This is the “bridge”: New AD groups become the single source Keycloak queries; those groups contain Main AD identities (directly or via Global groups).
+
+How (PowerShell from New AD)
+
+# Preferred: add Main AD *Global group(s)*
+Add-ADGroupMember -Identity "SCI_Analytics_Admin" -Members "MAIN\GG_SCI_Analytics_Admins"
+
+# Or add individual Main AD users
+Add-ADGroupMember -Identity "SCI_Analytics_Member" -Members "MAIN\jdoe","MAIN\asmith"
+
+
+Verify
+
+In the New AD group’s Members tab, you’ll see Foreign Security Principals (FSPs) when members come from Main AD.
+
+Get-ADGroupMember "SCI_Analytics_Admin" should list them.
+
+Pitfalls
+
+Use Global groups in Main AD and Universal in New AD (AGUDLP‑style).
+
+If membership lookups are flaky, recheck trust, DNS, and SID filtering.
+
+4) Keycloak LDAP federation to New AD (LDAPS, read‑only)
+
+Why
+
+Keycloak authenticates and reads groups from New AD. Because of the trust, those New AD groups can include Main AD users/groups.
+
+How (Keycloak Admin Console)
+
+User Federation → Add provider → LDAP
+
+Vendor: Active Directory
+
+Connection URL: ldaps://dc1.new.corp:636 (use LDAPS)
+
+Bind DN / Credential: service account in New AD
+
+Users DN: e.g., DC=new,DC=corp (or narrower OU)
+
+Edit Mode: READ_ONLY
+
+Import Users: ON or OFF (your preference)
+
+Use Truststore SPI: set to use the realm or system truststore
+
+Import the New AD CA cert into Keycloak’s truststore if needed.
+
+Verify
+
+Click Test connection / Test authentication.
+
+Users → search a Main AD user who is a member of a New AD group (via trust). It should appear after first login or sync (depending on “Import users”).
+
+Pitfalls
+
+LDAPS fails if the CA isn’t trusted by Keycloak.
+
+Over‑broad “Users DN” can make sync slow—scope it if possible.
+
+5) Keycloak Group LDAP Mapper → New AD Groups OU
+
+Why
+
+Maps AD groups (under your New AD Groups OU) to Keycloak groups so Keycloak can emit them in SAML.
+
+How
+
+In the LDAP provider: Mappers → Create → group-ldap-mapper
+
+LDAP Groups DN: OU=Groups,OU=Cloud,OU=SCI,OU=Corp,DC=new,DC=corp
+
+Group Name LDAP Attribute: cn
+
+Membership LDAP Attribute: member
+
+Membership Attribute Type: DN
+
+User LDAP Attribute: sAMAccountName
+
+Mode: READ_ONLY
+
+Run Synchronize changed users (or Sync all users) once.
+
+Verify
+
+Groups in Keycloak should mirror your AD group names (e.g., SCI_Analytics_Admin).
+
+A test user shows those Keycloak groups on their Groups tab after login or sync.
+
+Pitfalls
+
+Wrong Groups DN = no group sync.
+
+Case/spacing mismatches later break Keystone mappings.
+
+6) Keycloak SAML client for Keystone includes Group list mapper → groups
+
+Why
+
+Keystone needs the group list in the SAML assertion to map access.
+
+How
+
+Clients → your Keystone/Horizon SAML client (SP) → Add mapper
+
+Mapper Type: Group list
+
+Name: groups
+
+SAML Attribute Name: groups
+
+SAML Attribute NameFormat: Basic
+
+Single Group Attribute: OFF (so it’s multi‑valued)
+
+Verify
+
+Use a browser SAML tracer: after SSO, the assertion should include multiple Attribute Name="groups" values like SCI_Analytics_Admin, SCI_Analytics_Member, etc.
+
+Pitfalls
+
+If you configured OIDC instead of SAML, use a Group membership claim mapper; the Keystone side must match the protocol you pick.
+
+7) Keystone local groups mirror AD names (1:1)
+
+We need to create groups in Keystone, then map them to AD groups? Do we do this with policies?
+Create groups in Keystone and map via federation mapping rules—not via policy.yaml. Policies govern what roles can do, while federation mappings tie incoming SAML attributes (like groups) to local Keystone groups (which you then grant roles on projects).
+
+How (Keystone CLI)
+
+# Create Keystone groups that mirror AD group names
+openstack group create SCI_Analytics_Admin
+openstack group create SCI_Analytics_Member
+openstack group create SCI_Analytics_Reader
+
+
+Verify
+
+openstack group list shows them.
+
+Pitfalls
+
+Name mismatches (case/spacing) will cause mapping misses.
+
+8) Keystone roles granted to those groups on projects
+
+Why
+
+This is the actual authorization: local group → role on project.
+
+How
+
+# Ensure roles exist
+openstack role create admin
+openstack role create member
+openstack role create reader
+
+# Ensure project exists
+openstack project create Analytics --domain Default
+
+# Bind roles to groups on the project
+openstack role add --group SCI_Analytics_Admin  --project Analytics admin
+openstack role add --group SCI_Analytics_Member --project Analytics member
+openstack role add --group SCI_Analytics_Reader --project Analytics reader
+
+
+Verify
+
+openstack role assignment list --project Analytics --names shows the grants.
+
+9) Keystone IdP, mapping, and SAML protocol created
+
+Why
+
+Teaches Keystone how to turn incoming SAML groups into local Keystone groups.
+
+How
+
+Identity Provider (IdP) (Keycloak)
+
+openstack identity provider create keycloak \
+  --remote-id "https://keycloak.new.corp/auth/realms/SCI" \
+  --enabled
+
+
+--remote-id = Keycloak realm/entityID your SP trusts.
+
+Mapping rules (AD → Keystone groups)
+Create keycloak_sci_mapping.json:
+
+{
+  "rules": [
+    {
+      "local": [ { "group": { "name": "SCI_Analytics_Admin" } } ],
+      "remote": [ { "type": "groups", "any_one_of": ["SCI_Analytics_Admin"] } ]
+    },
+    {
+      "local": [ { "group": { "name": "SCI_Analytics_Member" } } ],
+      "remote": [ { "type": "groups", "any_one_of": ["SCI_Analytics_Member"] } ]
+    },
+    {
+      "local": [ { "group": { "name": "SCI_Analytics_Reader" } } ],
+      "remote": [ { "type": "groups", "any_one_of": ["SCI_Analytics_Reader"] } ]
+    }
+  ]
+}
+
+
+Apply:
+
+openstack mapping create keycloak_sci_mapping --rules keycloak_sci_mapping.json
+
+
+Protocol binding
+
+openstack federation protocol create saml \
+  --identity-provider keycloak \
+  --mapping keycloak_sci_mapping
+
+
+Verify
+
+User SSO via Horizon → after first login, check effective assignments:
+
+openstack role assignment list --user <shadow-user> --names --effective
+
+
+Should show admin/member/reader on the Analytics project per their group.
+
+Pitfalls
+
+If you don’t see assignments: confirm the SAML assertion’s groups values exactly match the mapping rules and the local Keystone group names.
+
+This is not done in policy.yaml—that’s separate (what “admin” can do, etc.).
+
+Quick end‑to‑end test
+
+Add MAIN\jdoe to SCI_Analytics_Member (in New AD).
+
+Log in to Horizon via Keycloak SSO.
+
+Inspect SAML assertion → groups includes SCI_Analytics_Member.
+
+In Keystone, verify assignments:
+
+openstack role assignment list --user <shadow-user> --effective --names | grep Analytics
+
+
+You should see member on Analytics.
+
+Common gotchas & fixes
+
+No groups in SAML: missing Keycloak Group list mapper on the SAML client.
+
+Group names differ: fix names or add more mapping rules (any_one_of).
+
+AD trust misconfigured: you won’t see Main AD identities as members in New AD groups → fix trust / SID routing.
+
+LDAPS fails: import New AD CA into Keycloak truststore.
+
+Policy confusion: Remember: mapping puts users in Keystone groups; roles are granted to those groups; policies define what those roles can do.
+
+If you want, I can give you a one‑shot script bundle that:
+
+Creates the New AD groups (PowerShell),
+
+Generates the Keycloak mappers (JSON, ready to import),
+
+Applies the Keystone IdP/mapping/protocol and group/role bindings (bash).
