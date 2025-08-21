@@ -807,3 +807,76 @@ Creates the New AD groups (PowerShell),
 Generates the Keycloak mappers (JSON, ready to import),
 
 Applies the Keystone IdP/mapping/protocol and group/role bindings (bash).
+
+
+-------
+Got it — if you want to copy Keystone roles from one OpenStack environment to another (e.g., SCI-A → SCI-B), here’s the process:
+
+1. Export existing roles
+
+On the source environment:
+
+openstack role list -f yaml > roles-export.yaml
+
+
+This gives you all role names and IDs.
+(IDs are environment-specific, so only names matter when recreating.)
+
+Optional: if you only want custom roles, filter them (e.g., remove admin, member, reader, service).
+
+2. Create roles in the new environment
+
+On the target environment (SCI-B):
+
+# Simple loop to recreate roles
+for role in $(openstack role list -f value -c Name --os-cloud source-env); do
+  # Skip known defaults if you only want customs
+  if [[ "$role" != "admin" && "$role" != "member" && "$role" != "reader" && "$role" != "service" ]]; then
+    openstack role create "$role"
+  fi
+done
+
+3. Connect them to AD groups via Keycloak mapping
+
+Since this new environment points to a new AD (with a trust from the main AD):
+
+New AD: Create Universal Security Groups (SCI_Project_Admin, etc.).
+
+Add Main AD global groups or users into those New AD groups (trust allows this).
+
+Keycloak:
+
+LDAP federation to New AD.
+
+Group LDAP Mapper → New AD Groups OU.
+
+SAML group claim → Keystone.
+
+Keystone:
+
+Mirror those group names locally (openstack group create ...).
+
+Grant the roles you just copied:
+
+openstack role add --group SCI_Project_Admin --project ProjectX admin
+
+4. Verify
+
+Log in as a test Main AD user who belongs to a New AD group.
+
+Confirm group → role assignment:
+
+openstack role assignment list --user <shadow-user> --effective --names
+
+
+✅ Summary:
+
+Use openstack role list / openstack role create to copy roles over.
+
+Default roles exist already; only re-create customs.
+
+AD trust + Keycloak mapping ensures your users flow into those groups.
+
+Roles in Keystone just need to exist and be granted to Keystone groups that correspond to AD groups.
+
+
