@@ -879,4 +879,254 @@ AD trust + Keycloak mapping ensures your users flow into those groups.
 
 Roles in Keystone just need to exist and be granted to Keystone groups that correspond to AD groups.
 
+-----
+you don’t “copy Keystone roles” in Keycloak—Keystone roles stay in Keystone. In Keycloak you just make sure the same group names (from AD) are exposed in the SAML assertion so Keystone’s existing federation mapping keeps working.
+
+Here’s exactly what to do, and how to handle the AD timing.
+
+What to do in Keycloak
+
+(If not already) Use LDAP federation
+
+Add/confirm a Keycloak LDAP provider for the directory that holds the groups you want to emit.
+
+Set Edit mode = READ_ONLY, use LDAPS, and scope Users DN/Groups DN properly.
+
+Group LDAP Mapper (maps AD groups → Keycloak groups)
+
+Mapper type: group-ldap-mapper
+
+LDAP Groups DN: point at your Groups OU
+
+Group Name LDAP Attribute = cn, Membership LDAP Attribute = member, Membership Attribute Type = DN
+
+Sync groups (one-time full sync or on-demand).
+
+SAML “Group list” mapper on the Keystone client
+
+Client (your Keystone/Horizon SP) → Add Mapper → Group list
+
+Attribute name: groups (multi-valued)
+
+Result: SAML assertion contains groups=[SCI_Project_Admin, ...].
+
+Keep names stable
+
+The AD group names in SAML must match what Keystone’s mapping rules expect. If you change names, update Keystone’s mapping accordingly.
+
+Does the new AD need to be in place first?
+
+No—two workable paths:
+
+Path A — New AD ready now (recommended)
+
+Create Universal Security Groups in New AD with the same names (e.g., SCI_Analytics_Admin|Member|Reader).
+
+Add Main AD users or (better) Main AD global groups into those New AD groups (requires the two‑way forest trust).
+
+In Keycloak, point the LDAP provider to New AD, configure the Group LDAP Mapper to the New AD Groups OU, and keep the SAML Group list mapper.
+
+Because the group names are unchanged, Keystone’s IdP + mapping + protocol continue to work unchanged.
+
+Path B — Use current AD temporarily, cut over later
+
+Keep Keycloak LDAP pointing to Current AD for now; the SAML groups claim continues to match Keystone mappings.
+
+When New AD is ready:
+
+Create the same-named groups in New AD.
+
+Add Main AD globals/users into those New AD groups (via trust).
+
+Switch Keycloak LDAP from Current AD → New AD (or add New AD as a second LDAP and then disable the first).
+
+Re-run group sync and confirm SAML groups are identical.
+
+Important cutover tip (avoid new “shadow users” in Keystone)
+
+Keystone creates a federated shadow user keyed off the SAML subject and selected attributes in your mapping rules.
+
+In Keycloak’s Keystone client, set NameID to something stable across both ADs (e.g., UPN or email), and keep your Keystone mapping using that same attribute for user.name (or rely on NameID).
+
+If you switch directories and the subject/NameID changes (e.g., different objectGUID), Keystone will create a new shadow user. Keeping NameID stable prevents that.
+
+Do we need to “copy roles” in Keycloak?
+
+For OpenStack via SAML, you generally don’t use Keycloak roles; you pass AD group names in groups, and Keystone maps those to local Keystone groups, which have roles on projects.
+
+If you also use Keycloak client roles for other apps, export/import the realm/client to replicate those. But for Keystone access, the group list approach is standard and simpler.
+
+Minimal checklists
+If New AD is ready
+
+ New AD groups created (same names as today)
+
+ Trust validated (Main AD users/groups can be added to New AD groups)
+
+ Keycloak LDAP → New AD (LDAPS)
+
+ Group LDAP Mapper → New AD Groups OU
+
+ SAML client has Group list mapper
+
+ Test: SAML assertion shows identical groups; Keystone login works
+
+If using Current AD first
+
+ Keep Keycloak LDAP → Current AD
+
+ Later: mirror groups in New AD (same names), add Main AD groups/users
+
+ Switch Keycloak LDAP → New AD
+
+ Keep NameID/subject stable to avoid new shadow users
+
+ Test assertion + Keystone access
+
+If you want, I can draft the exact Keycloak export JSON snippets (LDAP provider + mappers + SAML client mappers) and a Keystone mapping.json that match your group names, so you can drop them in with minimal edits.
+
+You said:
+yes draft it
+ChatGPT said:
+Thought for 28s
+
+Great questions. Short answer first: roles live in Keystone, not Keycloak. In Keycloak you only need to make sure the same groups arrive in the SAML assertion so Keystone can map them to its local groups/role assignments. Here’s exactly what to do and how to handle “current AD vs new AD”.
+
+What to do in Keycloak
+
+Export your realm & Keystone client (once)
+
+In the Admin Console: Realm Settings → Export → Export groups, clients, identity providers, mappers → Download JSON.
+
+Or via CLI: kcadm.sh get realms/<realm> and get clients?clientId=<keystone-sp>, etc.
+
+You’ll import this into the new Keycloak (if you’re standing up a fresh KC) so your Keystone SAML client and mappers are identical.
+
+Set up LDAP “User Federation” to AD
+
+Add provider: User Federation → ldap.
+
+Connection: ldaps://… (use LDAPS), Bind DN, Bind credential.
+
+Edit mode: Read-only.
+
+Users DN: your people OU in New AD (or Current AD if you’re starting there).
+
+Periodic sync: enable (users & groups) so KC caches for speed.
+
+UUID attribute: typically objectGUID.
+
+Username: usually sAMAccountName (or userPrincipalName if you prefer UPN-style logins).
+
+Add an LDAP “Group mapper”
+
+Provider type: group-ldap-mapper.
+
+Groups DN: the OU in New AD that contains your project/role groups.
+
+Group name attribute: cn (common).
+
+Membership attribute: member (AD default).
+
+Mode: READ_ONLY.
+
+Drop non-existing groups during sync: off (at least initially).
+
+Sync groups now. You should see your AD groups appear under Groups in Keycloak.
+
+(Optional) Member‑Of mapper
+
+If you want faster group lookup, add user-attribute-ldap-mapper for memberOf so KC can resolve memberships without extra LDAP calls (depends on your AD schema).
+
+Ensure the Keystone SAML client returns groups
+
+Client: your Keystone SP client (Protocol: SAML).
+
+Client signature on, NameID format persistent (or transient if that’s your Keystone config).
+
+Mappers on this client:
+
+Group List → Token Claim Name: groups (or whatever your Keystone mapping rules expect), Full group path = off so you emit plain CNs like projA_admin.
+
+(Optional) Map eduPersonPrincipalName/upn/mail to claims Keystone might use.
+
+Test the assertion
+
+Use a test user in AD that’s in one of the new groups.
+
+Login to Keystone via SSO → inspect SAML (or Keystone’s federation mapping logs) to confirm groups contains the expected values.
+
+Reminder: In Keystone you create local groups that mirror AD group names and assign roles to those groups on projects. Keycloak’s job is just to assert the group names; no Keystone roles are defined in Keycloak.
+
+Do you need New AD in place first?
+
+Preferred: yes.
+Why: you can point Keycloak to New AD and sync only the New AD groups you designed per project/role. With a two‑way forest trust to Main AD, users from Main AD can still authenticate and will be resolved as members of those New AD groups. That keeps group names stable from day one.
+
+Not strictly required: you can start with Current/Main AD:
+
+Point Keycloak’s LDAP to Main AD now.
+
+Later, add a second LDAP provider for New AD, sync groups/users, test, then disable the Main AD provider and keep New AD.
+
+Or “swing” the existing provider by changing connection URL/Base DN—just keep the exact same group names so Keystone doesn’t need any changes.
+
+Can you use the current AD temporarily?
+
+Yes. Two safe patterns:
+
+A) Parallel providers (safest)
+
+Add LDAP #2 pointing at New AD (read‑only).
+
+Create/import the groups in New AD (same CNs you’ll use in Keystone).
+
+With the trust in place, add Main AD users (or Global Groups) as members of the New AD groups.
+
+Verify Keycloak shows both sets but that the SAML group list includes the New AD group names you want.
+
+Cut over: disable LDAP #1 (Main AD) when satisfied.
+
+B) Swing the existing provider
+
+Freeze group names used by Keystone (e.g., projA_admin, projA_member).
+
+Change the LDAP connection to point at New AD and the Groups/User DNs to the new OUs.
+
+Because group CNs remain identical, Keystone continues to match them; no role rework.
+
+Small but important gotchas
+
+DN vs Name: In Keystone mappings, key off simple group names (CN) rather than full DNs; Keycloak’s Group List mapper with “Full path = off” helps keep names stable.
+
+Case & spacing: Be consistent (projA_admin vs Proja_Admin). Keystone matching is string‑based.
+
+Cache & sync: After changing LDAP providers, run “Synchronize changed users” and “Synchronize changed groups” in Keycloak; clear any reverse-proxy caches in front of Keystone if assertions are sticky.
+
+TLS: Use LDAPS with valid CA chains for both ADs; Keycloak will refuse to bind if it can’t trust the certs.
+
+Testing realm: If you can, clone the realm and Keystone client in a staging Keycloak; validate SAML against a Keystone staging before production cutover.
+
+Minimal checklist to “copy roles” end‑to‑end
+
+Keycloak:
+
+Import/clone realm + Keystone SAML client.
+
+LDAP federation → New AD (or Main AD temporarily).
+
+Group LDAP mapper → New AD Groups OU.
+
+Client “Group List” mapper → groups.
+
+Keystone:
+
+Create local groups with the same names as AD groups.
+
+Grant roles to those groups on projects (unchanged).
+
+Confirm SSO: user in AD group → appears in Keystone with the right project/role.
+
+
+
 
