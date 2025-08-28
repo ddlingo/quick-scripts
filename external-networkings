@@ -1,0 +1,203 @@
+Here’s a clean, repeatable way to (re)build it so:
+
+Server1 (sms-designate) is reachable from the internet, and
+
+Server2 (bind0) (on a different tenant network) can reach Server1 privately.
+
+I’ll show the recommended topology, then the exact OpenStack CLI to create/attach things, plus the security group rules you need.
+
+Target topology (tenant view)
+[ External/Public Net ]  <-- floating IP -->  sms-designate (fixed: 192.168.199.x)
+           ^                                   |
+           |                             (same tenant router)
+           |                                   |
+      [ Neutron Router ] ------------------ bind0 (fixed: 10.47.35.x)
+             |  \
+             |   \- interface to subnet A (sms-designate net)
+             \----- interface to subnet B (bind0 net)
+
+
+One Neutron router with:
+
+External gateway set to your provider’s external network
+
+Two internal interfaces: one per tenant subnet
+
+Server1 gets a floating IP (public access).
+
+East-west traffic between the two tenant subnets flows through the same router.
+
+Security groups explicitly allow SSH, ICMP, and your app ports (e.g., DNS 53) from the other VM’s SG (remote-group) or its subnet CIDR.
+
+0) (Optional) Pick an auth method that won’t expire mid-ops
+
+If you use SSO in Horizon, create an Application Credential and use it in your CLI (cleanest). Otherwise use standard v3 password auth. (I’ll assume your CLI already works.)
+
+1) Create the two tenant networks + subnets
+
+(If they already exist, skip.)
+
+# Network for sms-designate
+openstack network create sms-net
+openstack subnet create sms-subnet \
+  --network sms-net \
+  --subnet-range 192.168.199.0/24 \
+  --gateway 192.168.199.1 \
+  --dns-nameserver 1.1.1.1
+
+# Network for bind0
+openstack network create bind-net
+openstack subnet create bind-subnet \
+  --network bind-net \
+  --subnet-range 10.47.35.0/24 \
+  --gateway 10.47.35.1 \
+  --dns-nameserver 1.1.1.1
+
+
+Use your real CIDRs; don’t overlap with each other or the external network.
+
+2) Create ONE router; attach both subnets; set external gateway
+
+(If you already have a router, reuse it. The key is: both subnets on the same router.)
+
+# Create router
+openstack router create tenant-router
+
+# Attach both subnets
+openstack router add subnet tenant-router sms-subnet
+openstack router add subnet tenant-router bind-subnet
+
+# Set router external gateway (replace with your cloud’s external net name)
+openstack router set --external-gateway <EXTERNAL-NET-NAME> tenant-router
+
+
+If a subnet is already attached to a different router, first remove it:
+openstack router remove subnet <old-router> <subnet-id>, then add to tenant-router.
+
+3) Security groups — safest & future-proof: remote-group rules
+
+Attach the same SG to both servers and allow members to talk to each other for SSH/ICMP (and DNS for Designate/Bind).
+
+# Create an SG for these two servers (or reuse 'default' if both have it)
+openstack security group create intra-svc
+
+# Allow ICMP within the group
+openstack security group rule create intra-svc \
+  --ingress --ethertype IPv4 --protocol icmp --remote-group intra-svc
+
+# Allow SSH within the group
+openstack security group rule create intra-svc \
+  --ingress --ethertype IPv4 --protocol tcp --dst-port 22 --remote-group intra-svc
+
+# (Optional) Allow DNS if these are DNS components
+openstack security group rule create intra-svc \
+  --ingress --ethertype IPv4 --protocol udp --dst-port 53 --remote-group intra-svc
+openstack security group rule create intra-svc \
+  --ingress --ethertype IPv4 --protocol tcp --dst-port 53 --remote-group intra-svc
+
+
+Attach intra-svc to both instances’ ports (or at boot via --security-group intra-svc):
+
+# If servers already exist:
+openstack server add security group sms-designate intra-svc
+openstack server add security group bind0        intra-svc
+
+
+Alternative (quick & explicit): allow by CIDR instead of remote-group:
+--remote-ip 10.47.35.0/24 for rules on sms-designate’s SG, etc.
+
+4) Launch (or rewire) the servers on their networks
+
+If creating fresh:
+
+openstack server create sms-designate \
+  --flavor <flavor> --image <image> \
+  --nic net-id=$(openstack network show -f value -c id sms-net) \
+  --security-group intra-svc \
+  --key-name <your_keypair>
+
+openstack server create bind0 \
+  --flavor <flavor> --image <image> \
+  --nic net-id=$(openstack network show -f value -c id bind-net) \
+  --security-group intra-svc \
+  --key-name <your_keypair>
+
+
+If they already exist but are on wrong networks, you can attach/detach ports:
+
+# Add a NIC to the right network (if needed)
+openstack port create sms-port --network sms-net
+openstack server add port sms-designate $(openstack port show -f value -c id sms-port)
+
+# (Optional) remove an old/wrong port after confirming the new one works
+openstack server remove port sms-designate <old-port-id>
+
+5) Give sms-designate a floating IP (external access)
+openstack floating ip create <EXTERNAL-NET-NAME>
+# Note the created FIP
+openstack server add floating ip sms-designate <FLOATING_IP>
+
+
+From the internet/VPN:
+
+nc -vz <FLOATING_IP> 22
+ssh -i ~/.ssh/<key> <user>@<FLOATING_IP>
+
+6) OS firewalls on the guests
+
+Make sure host firewalls aren’t blocking:
+
+RHEL/Rocky/Alma
+
+sudo firewall-cmd --permanent --add-service=ssh
+sudo firewall-cmd --permanent --add-service=dns      # if acting as DNS
+sudo firewall-cmd --reload
+
+
+Ubuntu
+
+sudo ufw allow ssh
+sudo ufw allow 53/tcp
+sudo ufw allow 53/udp
+
+7) Sanity tests (east–west + north–south)
+
+From bind0 → sms-designate (east–west using fixed IP):
+
+ping -c1 <sms-designate-fixed-ip>
+nc -vz <sms-designate-fixed-ip> 22
+ssh <user>@<sms-designate-fixed-ip>
+
+
+From outside → sms-designate (north–south using floating IP):
+
+nc -vz <FLOATING_IP> 22
+ssh <user>@<FLOATING_IP>
+
+
+If east–west still times out:
+
+Confirm both subnets are on the same router:
+openstack router show tenant-router -c interfaces_info
+
+Confirm both servers have the intra-svc SG:
+openstack server show <name> -c security_groups
+
+On the controller/network node (if you have access), verify via namespace:
+
+ip netns list
+ip netns exec qrouter-<UUID> nc -vz <sms-designate-fixed-ip> 22
+
+Minimal checklist recap
+
+One router, external gateway set, both subnets attached
+
+Floating IP on sms-designate
+
+Security group allowing intra-group SSH/ICMP (and DNS if needed), attached to both servers
+
+Guest firewalls permit SSH/DNS
+
+Test fixed-IP from bind0 → sms-designate; test floating IP from outside
+
+Follow that recipe and both requirements (public access to sms-designate; private access from bind0 on a different tenant network) will work reliably.
