@@ -1128,5 +1128,512 @@ Grant roles to those groups on projects (unchanged).
 Confirm SSO: user in AD group → appears in Keystone with the right project/role.
 
 
+---------------------------
+role convert
+versions.tf
+terraform {
+  required_version = ">= 1.4.6"
+
+  required_providers {
+    openstack = {
+      source  = "terraform-provider-openstack/openstack"
+      version = "~> 1.54"
+    }
+    null = {
+      source  = "hashicorp/null"
+      version = ">= 3.2.1"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = ">= 3.4.3"
+    }
+    time = {
+      source  = "hashicorp/time"
+      version = ">= 0.9.1"
+    }
+  }
+}
+
+environment.tf
+terraform {
+  backend "s3" {
+    bucket                      = var.tf_state_bucket
+    key                         = "${var.tf_state_prefix}/${terraform.workspace}/terraform.tfstate"
+    region                      = var.tf_state_region
+    endpoint                    = var.tf_state_endpoint
+    profile                     = var.tf_state_profile
+    force_path_style            = true
+    skip_credentials_validation = true
+    skip_region_validation      = true
+  }
+}
+
+provider "openstack" {
+  cloud  = var.os_cloud_name     # defined in variables.tf (clouds.yaml entry)
+  region = var.os_region_name
+}
+
+# Optional second provider (kept to mirror your “workspace” pattern)
+provider "openstack" {
+  alias  = "workspace"
+  cloud  = var.os_cloud_name
+  region = var.os_workspace_region != "" ? var.os_workspace_region : var.os_region_name
+}
+
+# ---- remote state readers (kept; just s3-compat) ----
+locals {
+  layer_00 = try(data.terraform_remote_state.layer_00.outputs, {})
+  layer_01 = try(data.terraform_remote_state.layer_01.outputs, {})
+  layer_02 = try(data.terraform_remote_state.layer_02.outputs, {})
+}
+
+data "terraform_remote_state" "layer_00" {
+  backend = "s3"
+  config = {
+    bucket                      = var.tf_state_bucket
+    key                         = "management/layer-00.tfstate"
+    region                      = var.tf_state_region
+    endpoint                    = var.tf_state_endpoint
+    profile                     = var.tf_state_profile
+    force_path_style            = true
+    skip_credentials_validation = true
+    skip_region_validation      = true
+  }
+}
+data "terraform_remote_state" "layer_01" {
+  backend = "s3"
+  config = {
+    bucket                      = var.tf_state_bucket
+    key                         = "management/layer-01.tfstate"
+    region                      = var.tf_state_region
+    endpoint                    = var.tf_state_endpoint
+    profile                     = var.tf_state_profile
+    force_path_style            = true
+    skip_credentials_validation = true
+    skip_region_validation      = true
+  }
+}
+data "terraform_remote_state" "layer_02" {
+  backend = "s3"
+  config = {
+    bucket                      = var.tf_state_bucket
+    key                         = "management/layer-02.tfstate"
+    region                      = var.tf_state_region
+    endpoint                    = var.tf_state_endpoint
+    profile                     = var.tf_state_profile
+    force_path_style            = true
+    skip_credentials_validation = true
+    skip_region_validation      = true
+  }
+}
+
+variables.tf
+# OpenStack auth/region (creds come from ~/.config/openstack/clouds.yaml)
+variable "os_cloud_name"  { type = string }
+variable "os_region_name" { type = string }
+variable "os_workspace_region" { type = string, default = "" }
+
+# Networking
+variable "external_network_name" { type = string }   # e.g., "FloatingIP-external-iaas-01"
+variable "sms_net_cidr"  { type = string }           # e.g., "192.168.199.0/24"
+variable "bind_net_cidr" { type = string }           # e.g., "10.47.35.0/24"
+variable "dns_nameservers" { type = list(string), default = ["1.1.1.1"] }
+
+# Compute
+variable "image_name"   { type = string }            # Glance image
+variable "flavor_name"  { type = string }            # Flavor name
+variable "keypair_name" { type = string }
+variable "extra_security_groups" { type = list(string), default = [] }
+
+# Remote state (S3-compatible)
+variable "tf_state_bucket"   { type = string }
+variable "tf_state_region"   { type = string }
+variable "tf_state_endpoint" { type = string }
+variable "tf_state_profile"  { type = string, default = null }
+variable "tf_state_prefix"   { type = string, default = "workspaces/iam-orchestration" }
+
+# Optional app/SAML (kept only if needed)
+variable "saml_metadata_path" { type = string, default = "" }
+
+variables-root.tf (AWS removed)
+variable "build_user"   { type = string }
+variable "root_module"  { type = string }
+variable "deployment_layer" { type = string, default = null }
+# (aws_account_id/aws_region removed; OpenStack uses os_cloud_name/os_region_name)
+
+variables-naming.tf (keep; provider-agnostic — add defaults)
+variable "label_order" { type = list(string), default = null }
+
+variable "organization" {
+  type    = object({ name = string, formatted = string, friendly = string })
+  default = { name = "sap", formatted = "SAP", friendly = "SAP" }
+}
+variable "security_boundary" {
+  type    = object({ name = string, formatted = string, friendly = string })
+  default = { name = "dev", formatted = "DEV", friendly = "Development" }
+}
+variable "business" {
+  type    = object({ name = string, formatted = string, friendly = string })
+  default = { name = "sms", formatted = "SMS", friendly = "Shared Management Services" }
+}
+variable "cloud_provider" {
+  type    = object({ name = string, formatted = string, friendly = string })
+  default = { name = "openstack", formatted = "OPENSTACK", friendly = "OpenStack" }
+}
+variable "cloud_partition" {
+  type    = object({ name = string, formatted = string, friendly = string })
+  default = { name = "sci", formatted = "SCI", friendly = "SCI" }
+}
+variable "minor_security_boundary" {
+  type    = object({ name = string, formatted = string, friendly = string })
+  default = { name = null, formatted = null, friendly = null }
+}
+variable "business_subsection" {
+  type    = object({ name = string, formatted = string, friendly = string })
+  default = { name = null, formatted = null, friendly = null }
+}
+variable "account_identifier" {
+  type = object({ name = string, formatted = string, friendly = string })
+  default = { name = null, formatted = null, friendly = null }
+}
+variable "customer" {
+  type = object({ name = string, single_tenant = bool, formatted = string, friendly = string })
+  default = { name = null, single_tenant = false, formatted = null, friendly = null }
+}
+variable "owner"       { type = string }
+variable "environment" { type = string }
+
+main.tf (AWS IAM modules removed; keep context/tags usable for OpenStack)
+locals {
+  context = {
+    workspace        = terraform.workspace
+    organization     = var.organization
+    security_boundary= var.security_boundary
+    business         = var.business
+    cloud_provider   = var.cloud_provider
+    cloud_partition  = var.cloud_partition
+    owner            = var.owner
+    environment      = var.environment
+    parent_domain_internal = "scs.internal"
+    parent_domain_external = "scs.sap"
+  }
+
+  # Reusable tags/metadata for OpenStack resources
+  tags = {
+    MinorSecurityBoundary = var.minor_security_boundary.formatted
+    BusinessSubsection    = var.business_subsection.formatted
+    AccountIdentifier     = var.account_identifier.formatted
+    Workspace             = terraform.workspace
+    Environment           = var.environment
+    Owner                 = var.owner
+  }
+}
+
+# (Compute/network resources will be added in your layer that creates sms-designate/bind0)
+# Example outputs below expose the context/tags for downstream modules.
+
+outputs.tf (AWS-IAM outputs removed)
+output "workspace" { value = terraform.workspace }
+
+output "context" {
+  value = {
+    workspace  = terraform.workspace
+    org        = var.organization.formatted
+    boundary   = var.security_boundary.formatted
+    business   = var.business.formatted
+    provider   = var.cloud_provider.formatted
+    partition  = var.cloud_partition.formatted
+    env        = var.environment
+    owner      = var.owner
+  }
+}
+
+output "tags" {
+  value = local.tags
+}
+
+Workspace tfvars (SCI versions)
+workspace-tfvars/dev-sms-L-sci.tfvars
+# OpenStack selector
+os_cloud_name   = "sci-dev"
+os_region_name  = "eu-de-1"
+
+# Networking
+external_network_name = "FloatingIP-external-iaas-01"
+sms_net_cidr  = "192.168.199.0/24"
+bind_net_cidr = "10.47.35.0/24"
+dns_nameservers = ["1.1.1.1"]
+
+# Compute
+image_name   = "Ubuntu-22.04"
+flavor_name  = "c4.m4"         # adjust to your SCI flavors
+keypair_name = "your-key"
+
+# Remote state S3-compat
+tf_state_bucket   = "sap-dev-sms-terraform"
+tf_state_region   = "eu-de-1"
+tf_state_endpoint = "https://s3.eu-de-1.vexxhost.net"
+tf_state_profile  = null
+tf_state_prefix   = "workspaces/iam-orchestration"
+
+# Naming
+owner       = "noreply-scs-security-engineering@sap.com"
+environment = "development"
+
+workspace-tfvars/dev-security-L-sci.tfvars
+os_cloud_name   = "sci-dev"
+os_region_name  = "eu-de-1"
+
+external_network_name = "FloatingIP-external-iaas-01"
+sms_net_cidr  = "192.168.199.0/24"
+bind_net_cidr = "10.47.35.0/24"
+dns_nameservers = ["1.1.1.1"]
+
+image_name   = "Ubuntu-22.04"
+flavor_name  = "c4.m4"
+keypair_name = "your-key"
+
+tf_state_bucket   = "sap-dev-security-terraform"
+tf_state_region   = "eu-de-1"
+tf_state_endpoint = "https://s3.eu-de-1.vexxhost.net"
+tf_state_profile  = null
+tf_state_prefix   = "workspaces/iam-orchestration"
+
+owner       = "security@sap.com"
+environment = "development"
+
+# Business label override if needed
+business = {
+  name      = "security"
+  formatted = "Security"
+  friendly  = "Security"
+}
+
+
+If you want me to add the actual OpenStack resources next (networks, subnets, router + external gateway, SGs, and the two instances sms-designate and bind0), say the word and I’ll append network.tf and compute.tf in SCI form.
+
+You said:
+Yes please do that
+ChatGPT said:
+Thought for a second
+Thought for 24s
+
+Awesome — here are the SCI OpenStack resource files you asked for. They plug into the vars we already set (os_cloud_name, external_network_name, sms_net_cidr, bind_net_cidr, etc.).
+
+network.tf
+# ── External (provider) network lookup ──────────────────────────────────────────
+data "openstack_networking_network_v2" "external" {
+  name = var.external_network_name
+}
+
+# ── Tenant networks & subnets ───────────────────────────────────────────────────
+resource "openstack_networking_network_v2" "sms" {
+  name           = "sms-network"
+  admin_state_up = true
+}
+
+resource "openstack_networking_subnet_v2" "sms" {
+  name            = "sms-subnet"
+  network_id      = openstack_networking_network_v2.sms.id
+  cidr            = var.sms_net_cidr
+  ip_version      = 4
+  gateway_ip      = cidrhost(var.sms_net_cidr, 1)
+  dns_nameservers = var.dns_nameservers
+  enable_dhcp     = true
+}
+
+resource "openstack_networking_network_v2" "bind" {
+  name           = "sms_bind_network"
+  admin_state_up = true
+}
+
+resource "openstack_networking_subnet_v2" "bind" {
+  name            = "sms_bind_subnet"
+  network_id      = openstack_networking_network_v2.bind.id
+  cidr            = var.bind_net_cidr
+  ip_version      = 4
+  gateway_ip      = cidrhost(var.bind_net_cidr, 1)
+  dns_nameservers = var.dns_nameservers
+  enable_dhcp     = true
+}
+
+# ── Single router with both subnets; gateway on external ────────────────────────
+resource "openstack_networking_router_v2" "tenant" {
+  name                = "sms-router"
+  external_network_id = data.openstack_networking_network_v2.external.id
+  admin_state_up      = true
+  tags                = [for k, v in local.tags : "${k}:${v}"]
+}
+
+resource "openstack_networking_router_interface_v2" "tenant_sms" {
+  router_id = openstack_networking_router_v2.tenant.id
+  subnet_id = openstack_networking_subnet_v2.sms.id
+}
+
+resource "openstack_networking_router_interface_v2" "tenant_bind" {
+  router_id = openstack_networking_router_v2.tenant.id
+  subnet_id = openstack_networking_subnet_v2.bind.id
+}
+
+security.tf
+# One SG shared by both servers so east–west works
+resource "openstack_networking_secgroup_v2" "intra" {
+  name        = "intra-svc"
+  description = "Intra-service SG for sms-designate & bind0"
+}
+
+# ICMP
+resource "openstack_networking_secgroup_rule_v2" "intra_icmp" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "icmp"
+  remote_group_id   = openstack_networking_secgroup_v2.intra.id
+  security_group_id = openstack_networking_secgroup_v2.intra.id
+}
+
+# SSH
+resource "openstack_networking_secgroup_rule_v2" "intra_ssh" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 22
+  port_range_max    = 22
+  remote_group_id   = openstack_networking_secgroup_v2.intra.id
+  security_group_id = openstack_networking_secgroup_v2.intra.id
+}
+
+# DNS (tcp/udp 53) – for designate/bind
+resource "openstack_networking_secgroup_rule_v2" "intra_dns_udp" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "udp"
+  port_range_min    = 53
+  port_range_max    = 53
+  remote_group_id   = openstack_networking_secgroup_v2.intra.id
+  security_group_id = openstack_networking_secgroup_v2.intra.id
+}
+
+resource "openstack_networking_secgroup_rule_v2" "intra_dns_tcp" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 53
+  port_range_max    = 53
+  remote_group_id   = openstack_networking_secgroup_v2.intra.id
+  security_group_id = openstack_networking_secgroup_v2.intra.id
+}
+
+# From anywhere: SSH to sms-designate (public)
+resource "openstack_networking_secgroup_rule_v2" "ssh_from_any" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 22
+  port_range_max    = 22
+  remote_ip_prefix  = "0.0.0.0/0"
+  security_group_id = openstack_networking_secgroup_v2.intra.id
+}
+
+compute.tf
+locals {
+  sms_port_name  = "port-sms-designate"
+  bind_port_name = "port-bind0"
+}
+
+# NICs (so we can attach SGs explicitly)
+resource "openstack_networking_port_v2" "sms" {
+  name                = local.sms_port_name
+  network_id          = openstack_networking_network_v2.sms.id
+  admin_state_up      = true
+  security_group_ids  = [openstack_networking_secgroup_v2.intra.id] ++ var.extra_security_groups
+  fixed_ip {
+    subnet_id  = openstack_networking_subnet_v2.sms.id
+    ip_address = cidrhost(var.sms_net_cidr, 204) # optional static; adjust or remove
+  }
+}
+
+resource "openstack_networking_port_v2" "bind" {
+  name                = local.bind_port_name
+  network_id          = openstack_networking_network_v2.bind.id
+  admin_state_up      = true
+  security_group_ids  = [openstack_networking_secgroup_v2.intra.id] ++ var.extra_security_groups
+  fixed_ip {
+    subnet_id  = openstack_networking_subnet_v2.bind.id
+    ip_address = cidrhost(var.bind_net_cidr, 20) # optional static; adjust or remove
+  }
+}
+
+# sms-designate (needs public access)
+resource "openstack_compute_instance_v2" "sms_designate" {
+  name            = "sms-designate"
+  image_name      = var.image_name
+  flavor_name     = var.flavor_name
+  key_pair        = var.keypair_name
+  tags            = [for k, v in local.tags : "${k}:${v}"]
+
+  network {
+    port = openstack_networking_port_v2.sms.id
+  }
+
+  # Optional metadata for clarity
+  metadata = {
+    role = "designate"
+  }
+}
+
+# Floating IP for sms-designate
+resource "openstack_networking_floatingip_v2" "sms_designate" {
+  pool = data.openstack_networking_network_v2.external.name
+}
+
+resource "openstack_compute_floatingip_associate_v2" "sms_designate" {
+  floating_ip = openstack_networking_floatingip_v2.sms_designate.address
+  instance_id = openstack_compute_instance_v2.sms_designate.id
+}
+
+# bind0 (private; no FIP)
+resource "openstack_compute_instance_v2" "bind0" {
+  name        = "bind0"
+  image_name  = var.image_name
+  flavor_name = var.flavor_name
+  key_pair    = var.keypair_name
+  tags        = [for k, v in local.tags : "${k}:${v}"]
+
+  network {
+    port = openstack_networking_port_v2.bind.id
+  }
+
+  metadata = {
+    role = "bind"
+  }
+}
+
+outputs-network-and-compute.tf
+output "sms_designate_fixed_ip" {
+  value = try(openstack_networking_port_v2.sms.all_fixed_ips[0], null)
+}
+
+output "sms_designate_floating_ip" {
+  value = openstack_networking_floatingip_v2.sms_designate.address
+}
+
+output "bind0_fixed_ip" {
+  value = try(openstack_networking_port_v2.bind.all_fixed_ips[0], null)
+}
+
+output "router_id" {
+  value = openstack_networking_router_v2.tenant.id
+}
+
+Notes / knobs you might tweak
+
+If you don’t want static fixed IPs, remove the ip_address = ... lines; DHCP will assign.
+
+Replace image_name/flavor_name with your SCI-approved values.
+
+If your external net has a different name than "FloatingIP-external-iaas-01", ensure external_network_name matches; the data source looks it up by name.
+
+If you need inbound DNS from the internet to sms-designate, add UDP/TCP 53 rules with remote_ip_prefix = "0.0.0.0/0" or restrict to your resolvers.
+
 
 
