@@ -1303,6 +1303,8 @@ variable "customer" {
 variable "owner"       { type = string }
 variable "environment" { type = string }
 
+±++++++++++++++++++++++++++++
+
 main.tf (AWS IAM modules removed; keep context/tags usable for OpenStack)
 locals {
   context = {
@@ -1328,9 +1330,88 @@ locals {
     Owner                 = var.owner
   }
 }
++++++++++++++++++++++++
+module "base_context" {
+  source = "../../../modules/terraform-null-context"
 
+  # prefer variables over literals
+  account_id        = var.account_id        # avoid "test"
+  build_user        = var.build_user
+  business          = var.business.name
+  customer          = var.customer_single_tenant ? var.business.name : var.customer.name
+  include_customer_label = var.customer_single_tenant
+  environment       = var.environment
+  organization      = var.organization.name
+  label_order       = var.label_order
+  owner             = var.owner
+  partition         = var.partition          # avoid hard-coding "dev"
+  region            = var.region             # keep consistent with your vars (sci_region vs region)
+  root_module       = var.root_module
+  security_boundary = var.security_boundary.name
+
+  # These become convenient, standardized outputs (often used as tags, SSM params, etc.)
+  environment_values = {
+    kv = {
+      organization_formatted              = var.organization.formatted
+      organization_friendly_name          = var.organization.friendly
+      security_boundary_formatted         = var.security_boundary.formatted
+      security_boundary_friendly_name     = var.security_boundary.friendly
+      business_formatted                  = var.business.formatted
+      business_friendly_name              = var.business.friendly
+      cloud_provider                      = var.cloud_provider.name
+      cloud_provider_formatted            = var.cloud_provider.formatted
+      cloud_provider_friendly_name        = var.cloud_provider.friendly
+      cloud_partition                     = var.cloud_partition.name
+      cloud_partition_formatted           = var.cloud_partition.formatted
+      cloud_partition_friendly_name       = var.cloud_partition.friendly
+      minor_security_boundary             = var.minor_security_boundary.name
+      minor_security_boundary_formatted   = var.minor_security_boundary.formatted
+      minor_security_boundary_friendly_name = var.minor_security_boundary.friendly
+      business_subsection                 = var.business_subsection.name
+      business_subsection_formatted       = var.business_subsection.formatted
+      business_subsection_friendly_name   = var.business_subsection.friendly
+      account_identifier                  = var.account_identifier.name
+      account_identifier_formatted        = var.account_identifier.formatted
+      account_identifier_friendly_name    = var.account_identifier.friendly
+      customer_formatted                  = var.customer.formatted
+      customer_friendly_name              = var.customer.friendly
+      parent_domain_internal              = var.parent_domain_internal   # e.g., "scs.internal"
+      parent_domain_external              = var.parent_domain_external   # e.g., "scs.sap"
+    }
+  }
+
+  # Optional: extra, non-blocking tags to ensure presence (if your module supports this)
+  tags = [
+    { name = "MinorSecurityBoundary", value = "minor_security_boundary", required = false },
+    { name = "BusinessSubsection",   value = "business_subsection",     required = false },
+    { name = "AccountIdentifier",    value = "account_identifier",      required = false },
+  ]
+}
+
+# Make sure you expose and pass the context everywhere else:
+output "context" {
+  value = module.base_context.context
+}
+
+# Example of passing into other modules
+module "network" {
+  source  = "../modules/network"
+  context = module.base_context.context
+  # ...
+}
+
+
+
+
+
++++++++++++++(+++++++
 # (Compute/network resources will be added in your layer that creates sms-designate/bind0)
 # Example outputs below expose the context/tags for downstream modules.
+
+
+
+
+
 
 outputs.tf (AWS-IAM outputs removed)
 output "workspace" { value = terraform.workspace }
