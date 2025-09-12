@@ -278,5 +278,104 @@ domain_id                  = "default"
 
 ---
 
-**This is the standard pattern for assigning multiple roles to a group in OpenStack with Terraform.**  
-Let me know if you want an example supporting multiple groups and multiple roles!
+Absolutely! Here’s a clear step-by-step guide for using the Terraform files to assign multiple roles to a group in OpenStack (with a federated group, e.g., from Keycloak/SCI):
+
+---
+
+## **1. Files You’ll Use**
+
+- `variables.tf` — defines the variables you need to set.
+- `keystone.tf` — contains the resources and data sources for looking up groups, roles, and assigning them.
+- `.tfvars` file (e.g., `dev-multi-role.tfvars`) — specifies values for your variables.
+- (Optional: `provider.tf`) — OpenStack authentication setup, often uses `clouds.yaml` or environment variables.
+
+---
+
+## **2. What You Need to Edit**
+
+### a. **Edit the `.tfvars` file** (e.g., `dev-multi-role.tfvars`)
+Set the values for:
+- The group name (`federated_group_local_name`) as it appears in OpenStack (from Keycloak/SCI).
+- The list of role names (`openstack_role_names`) you want to assign to the group.
+- The project name and domain id.
+
+**Example:**
+```hcl name=dev-multi-role.tfvars
+federated_group_local_name = "SAP_Developers"
+openstack_role_names       = ["member", "custom_project_admin", "reader"]
+project_name               = "dev-sms"
+domain_id                  = "default"
+```
+
+---
+
+### b. **Edit `variables.tf` if you want to add/change variables**
+You usually don’t need to change this unless you want to support more variables.
+
+---
+
+### c. **Edit `keystone.tf` only if you want to customize the resources or logic**
+You can usually leave this as-is, unless you want to support multiple groups, different assignment logic, etc.
+
+---
+
+### d. **Edit `provider.tf` ONLY if you want to change how you authenticate**
+- If you use `clouds.yaml`, you may not need to change anything.
+- If you want to switch to environment variables or inline credentials, update here.
+
+---
+
+## **3. Commands to Run**
+
+### a. **Initialize Terraform**
+```sh
+terraform init
+```
+
+### b. **Check Your Plan**
+```sh
+terraform plan -var-file=dev-multi-role.tfvars
+```
+- This will show you what resources Terraform will create/change.
+
+### c. **Apply the Configuration**
+```sh
+terraform apply -var-file=dev-multi-role.tfvars
+```
+- Terraform will prompt for approval. Type `yes` to proceed.
+
+---
+
+## **4. (Optional) Clean Up**
+
+If you want to destroy the resources (remove the assignments):
+
+```sh
+terraform destroy -var-file=dev-multi-role.tfvars
+```
+
+---
+
+## **Summary Table**
+
+| File                  | What to edit?                             |
+|-----------------------|-------------------------------------------|
+| `dev-multi-role.tfvars` | Set group name, role names, project, domain |
+| `variables.tf`          | Only if you need extra variables        |
+| `keystone.tf`           | Only for advanced customization         |
+| `provider.tf`           | Only if changing authentication method  |
+
+---
+
+## **Checklist**
+
+1. Edit `.tfvars` with your group, roles, project, domain.
+2. Run `terraform init`.
+3. Run `terraform plan -var-file=YOURFILE.tfvars`.
+4. Run `terraform apply -var-file=YOURFILE.tfvars`.
+
+---
+
+**You do NOT need to edit the logic files unless your requirements change. Just update your `.tfvars`!**
+
+If you want, I can generate example `variables.tf`, `keystone.tf`, and `.tfvars` files for you—just let me know!
