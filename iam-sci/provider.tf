@@ -1,4 +1,12 @@
+terraform {
+  required_providers {
+    openstack = {
+      source  = "terraform-provider-openstack/openstack"
+      version = "~> 1.54.0"
+    }
+  }
+}
+
 provider "openstack" {
-  cloud  = var.os_cloud_name   # Example: "sci-dev" (must match your clouds.yaml entry)
-  region = var.os_region_name  # Example: "eu-de-1"
+  cloud = var.openstack_cloud
 }
