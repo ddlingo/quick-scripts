@@ -129,3 +129,65 @@ Prints resource IDs and info after apply.
 ---
 
 **Let me know if you want a sample for a specific environment or more detailed examples for any file!**
+Here’s the side-by-side you asked for—focused, no fluff.
+
+# AWS IAM Orchestration ↔ SCI (OpenStack Keystone) Orchestration
+
+| Topic                    | **AWS IAM (original)**                                               | **SCI / OpenStack Keystone (new)**                                                                        | Notes / Migration Tip                                                     |
+| ------------------------ | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| **Identity store**       | IAM (users, groups) in AWS                                           | Keystone (users, groups)                                                                                  | If you federate, most identities live in IdP (AD/Keycloak) not locally.   |
+| **AuthN**                | Access keys, console creds; SSO via SAML/OIDC (AWS SSO/IAM IdP)      | Tokens from Keystone; SSO via SAML/OIDC to Keystone                                                       | Keep SSO; switch IdP trust from AWS to Keystone.                          |
+| **Federation**           | IAM SAML/OIDC provider + role assumption                             | Keystone federation mapping (claims → Keystone groups)                                                    | Recreate mapping rules in Keystone; stop using IAM IdP.                   |
+| **Principals**           | Users, Roles, Groups                                                 | Users, Roles, Groups                                                                                      | Same concepts; different APIs.                                            |
+| **Permission unit**      | **Policies** (JSON) attached to roles/users/groups                   | **Policies** (policy.yaml) enforced per service; **roles** are labels                                     | In Keystone, roles are labels; service policies interpret them.           |
+| **Role granularity**     | Fine-grained IAM JSON (Allow/Deny, resource ARNs)                    | Roles are additive; services gate actions via policy rules (no explicit deny)                             | Expect “union of roles” behavior; design least-priv via service policies. |
+| **Scope**                | Account / resource-ARN scoped; cross-account via trust               | Project (tenant) / domain scoped                                                                          | Map AWS “accounts” → Keystone **projects** (or domains).                  |
+| **Cross-X access**       | Cross-account **assume-role** trust                                  | Multi-project role assignment (user/group ↔ role ↔ project)                                               | No assume-role; you grant roles in each project.                          |
+| **Resource-side policy** | Many AWS services support resource policies (S3 bucket policy, etc.) | Most OpenStack services use centralized policy.yaml; few resource-side ACLs                               | Manage at service policy + role level.                                    |
+| **Infra state**          | Terraform aws\_iam\_\*                                               | Terraform **openstack\_**\* (for compute/network); Keystone RBAC often configured outside TF or via tools | Treat identity as platform config (Keystone), infra (nets/VMs) in TF.     |
+| **Auditing**             | CloudTrail, IAM Access Analyzer                                      | Keystone + service logs, audit middleware                                                                 | Ensure logs retained centrally (ELK/SIEM).                                |
+
+## What carries over vs changes
+
+**Carries over**
+
+* Groups ↔ roles mapping (via federation claims).
+* Per-environment isolation (workspaces → projects).
+* “Least privilege” mindset (but enforced differently).
+
+**Changes**
+
+* No explicit **Deny** in Keystone; permissions are **additive** across roles.
+* No **assume-role**; instead, **assign roles per project** to users/groups.
+* Fine-grained JSON policies → **service policy rules** (policy.yaml) + role names.
+
+## Minimal migration checklist
+
+1. **Federation**
+
+   * Export AD/Keycloak group claims.
+   * Create Keystone **mapping rules** (claims → Keystone groups).
+   * Assign **roles** to those groups **per project**:
+
+     ```
+     openstack role add --group <grp> --project <proj> <role>
+     ```
+
+2. **Roles & Policies**
+
+   * Pick standard roles (`admin`, `member`, `reader`) and add custom roles only if policy needs it.
+   * Review each service’s **policy.yaml** (Nova/Neutron/Cinder) to ensure `member/reader/admin` do exactly what you expect.
+
+3. **Project layout**
+
+   * Map AWS accounts/workspaces → **Keystone projects** (and optional **domains** for higher-level separation).
+   * Grant groups the right roles in each project (no assume-role hop).
+
+4. **Terraform**
+
+   * Remove `aws_iam_*`.
+   * Keep Terraform for **network/compute/security groups** (OpenStack provider).
+   * Manage Keystone federation & policy via platform automation (Ansible/OpenStack CLI) or a dedicated TF module if you decide to codify it.
+
+If you want, I can draft the **Keystone federation mapping** (Keycloak/AD → Keystone groups) and the **role add** commands for your `SCI-scs-dev` project so you can paste-and-go.
+
