@@ -191,3 +191,92 @@ Here’s the side-by-side you asked for—focused, no fluff.
 
 If you want, I can draft the **Keystone federation mapping** (Keycloak/AD → Keystone groups) and the **role add** commands for your `SCI-scs-dev` project so you can paste-and-go.
 
+To assign multiple roles to a group in a single OpenStack project using Terraform, you’ll want to:
+
+1. Make your role variable a list of role names.
+2. Use a `for_each` or a loop to look up and assign each role to the group.
+3. Keep your group and project variable as usual.
+
+Here’s a complete, practical example:
+
+---
+
+```hcl name=variables.tf
+variable "federated_group_local_name" {
+  type = string
+}
+variable "openstack_role_names" {
+  type = list(string) # List of role names
+}
+variable "project_name" {
+  type = string
+}
+variable "domain_id" {
+  type = string
+}
+```
+
+---
+
+```hcl name=keystone.tf
+# Lookup the group (federated from Keycloak/SCI)
+data "openstack_identity_group_v3" "federated_group" {
+  name      = var.federated_group_local_name
+  domain_id = var.domain_id
+}
+
+# Lookup each role by name
+data "openstack_identity_role_v3" "roles" {
+  for_each = toset(var.openstack_role_names)
+  name     = each.value
+}
+
+# Create the project
+resource "openstack_identity_project_v3" "project" {
+  name      = var.project_name
+  domain_id = var.domain_id
+}
+
+# Assign each role to the group in the project
+resource "openstack_identity_role_assignment_v3" "group_role_assignments" {
+  for_each   = data.openstack_identity_role_v3.roles
+  group_id   = data.openstack_identity_group_v3.federated_group.id
+  project_id = openstack_identity_project_v3.project.id
+  role_id    = each.value.id
+}
+```
+
+---
+
+```hcl name=workspace-tfvars/dev-multi-role.tfvars
+federated_group_local_name = "SAP_Developers"
+openstack_role_names       = ["member", "custom_project_admin", "reader"]
+project_name               = "dev-sms"
+domain_id                  = "default"
+```
+
+---
+
+## How it works
+
+- You provide a list of role names in `openstack_role_names` (in your `.tfvars`).
+- Terraform will look up each role and assign it to the group in the specified project.
+- All members of the group will receive the permissions of **all assigned roles** in the project.
+
+---
+
+## To use:
+
+1. Add or update the variables in your `variables.tf` and `.tfvars`.
+2. Use the updated `keystone.tf` code above.
+3. Run:
+   ```sh
+   terraform init
+   terraform plan -var-file=workspace-tfvars/dev-multi-role.tfvars
+   terraform apply -var-file=workspace-tfvars/dev-multi-role.tfvars
+   ```
+
+---
+
+**This is the standard pattern for assigning multiple roles to a group in OpenStack with Terraform.**  
+Let me know if you want an example supporting multiple groups and multiple roles!
