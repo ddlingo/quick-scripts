@@ -1,78 +1,24 @@
-variable "project_name" {}
-variable "domain_id" { default = "default" }
-variable "federated_group_local_name" {}
-variable "openstack_role_name" {}
-variable "bootstrap_admin_name" { default = "" }
-variable "bootstrap_admin_password" { default = "" }
+variable "openstack_cloud" {
+  description = "Name of the OpenStack cloud as defined in clouds.yaml"
+  type        = string
+}
 
-# Example tags/context variables
-variable "environment" {}
-variable "owner" {}
-variable "organization" {
-  type = object({
-    formatted = string
-    friendly  = string
-  })
+variable "domain_id" {
+  description = "The OpenStack domain ID (usually 'default')"
+  type        = string
 }
-variable "security_boundary" {
-  type = object({
-    formatted = string
-    friendly  = string
-  })
-}
-variable "business" {
-  type = object({
-    formatted = string
-    friendly  = string
-  })
-}
-variable "cloud_provider" {
-  type = object({
-    name      = string
-    formatted = string
-    friendly  = string
-  })
-}
-variable "cloud_partition" {
-  type = object({
-    name      = string
-    formatted = string
-    friendly  = string
-  })
-}
-variable "minor_security_boundary" {
-  type = object({
-    name      = string
-    formatted = string
-    friendly  = string
-  })
-}
-variable "business_subsection" {
-  type = object({
-    name      = string
-    formatted = string
-    friendly  = string
-  })
-}
-variable "account_identifier" {
-  type = object({
-    name      = string
-    formatted = string
-    friendly  = string
-  })
-}
-variable "customer" {
-  type = object({
-    formatted = string
-    friendly  = string
-  })
-}
-variable "parent_domain_internal" {}
-variable "parent_domain_external" {}
 
-# Example compute/network variables
-variable "image_name" {}
-variable "flavor_name" {}
-variable "keypair_name" {}
-variable "os_cloud_name" {}
-variable "os_region_name" {}
+variable "project_name" {
+  description = "The name of the OpenStack project"
+  type        = string
+}
+
+variable "federated_group_local_name" {
+  description = "The name of the federated group in Keystone"
+  type        = string
+}
+
+variable "openstack_role_names" {
+  description = "List of role names to assign to the group"
+  type        = list(string)
+}
