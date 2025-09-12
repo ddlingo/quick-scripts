@@ -74,3 +74,5 @@ variable "parent_domain_external" {}
 variable "image_name" {}
 variable "flavor_name" {}
 variable "keypair_name" {}
+variable "os_cloud_name" {}
+variable "os_region_name" {}
