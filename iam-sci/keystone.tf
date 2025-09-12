@@ -1,55 +1,26 @@
-# Create project/tenant
-resource "openstack_identity_project_v3" "project" {
-  name        = var.project_name
-  domain_id   = var.domain_id
-  description = "Project for ${var.project_name}"
-}
-
-# Lookup for custom or standard role
-data "openstack_identity_role_v3" "role" {
-  name = var.openstack_role_name
-}
-
-# Lookup for federated group (populated via Keycloak/SCI)
+# Lookup the federated group by name
 data "openstack_identity_group_v3" "federated_group" {
   name      = var.federated_group_local_name
   domain_id = var.domain_id
 }
 
-# Assign role to federated group on project
-resource "openstack_identity_role_assignment_v3" "federated_group_assignment" {
+# Lookup each role by name
+data "openstack_identity_role_v3" "roles" {
+  for_each = toset(var.openstack_role_names)
+  name     = each.value
+}
+
+# Lookup the project by name
+data "openstack_identity_project_v3" "project" {
+  name      = var.project_name
+  domain_id = var.domain_id
+}
+
+# Assign each role to the group in the project
+resource "openstack_identity_role_assignment_v3" "group_role_assignments" {
+  for_each   = data.openstack_identity_role_v3.roles
   group_id   = data.openstack_identity_group_v3.federated_group.id
-  project_id = openstack_identity_project_v3.project.id
-  role_id    = data.openstack_identity_role_v3.role.id
+  project_id = data.openstack_identity_project_v3.project.id
+  role_id    = each.value.id
 }
 
-# Optional: Local admin user for initial testing/break-glass
-resource "openstack_identity_user_v3" "local_admin" {
-  count              = var.bootstrap_admin_name != "" ? 1 : 0
-  name               = var.bootstrap_admin_name
-  password           = var.bootstrap_admin_password
-  domain_id          = var.domain_id
-  default_project_id = openstack_identity_project_v3.project.id
-  enabled            = true
-}
-
-data "openstack_identity_role_v3" "admin" {
-  name = "admin"
-}
-
-resource "openstack_identity_role_assignment_v3" "bootstrap_admin_assignment" {
-  count      = var.bootstrap_admin_name != "" ? 1 : 0
-  user_id    = openstack_identity_user_v3.local_admin[0].id
-  project_id = openstack_identity_project_v3.project.id
-  role_id    = data.openstack_identity_role_v3.admin.id
-}
-
-output "federated_group_id" {
-  value = data.openstack_identity_group_v3.federated_group.id
-}
-output "project_id" {
-  value = openstack_identity_project_v3.project.id
-}
-output "bootstrap_admin_username" {
-  value = var.bootstrap_admin_name
-}
