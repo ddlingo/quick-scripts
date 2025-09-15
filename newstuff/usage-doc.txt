@@ -1,0 +1,9 @@
+File	Purpose
+main.tf	Context, locals, tags, toggles (no resources, just structure)
+openstack-federation.tf	Core logic: maps federated groups to OpenStack roles
+variables-root.tf	Defines context/org variables and remote state (S3) variables
+variables-naming.tf	Naming, feature toggles, group→role mapping, project id
+terraform.tfvars	Example/input values for all variables
+providers.tf	OpenStack provider setup and credentials
+outputs.tf	Outputs useful info (assignment IDs, mapping, etc.)
+remote-backend.tf	Configures S3 remote state backend for Terraform
