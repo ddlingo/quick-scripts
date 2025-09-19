@@ -1,0 +1,12 @@
+Keycloak roles  →  [imported into]  →  Keystone roles
+                     (already exist)
+
+Terraform mapping:
+  {
+    "group1": ["roleA", "roleB"],
+    "group2": ["roleC"]
+  }
+
+Terraform code:
+  For each group and each role in mapping:
+    Assign role to group in the target Keystone project
