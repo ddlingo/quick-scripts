@@ -1,0 +1,4 @@
+{
+  "keycloak-group1": ["member", "reader"],
+  "keycloak-admins": ["admin"]
+}
