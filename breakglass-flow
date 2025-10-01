@@ -1,0 +1,296 @@
+Manual (one-time runbook)
+0) Design choices (important)
+
+Break-glass key type: Prefer ED25519. If policy mandates RSA, use 4096-bit.
+
+Where to store the private key: HashiCorp Vault KV v2, with:
+
+tight ACL policy (read only for an on-call, short-lived role),
+
+response wrapping on delivery,
+
+metadata (reason, ticket, creator, expiry),
+
+automatic rotation cadence (e.g., 30–90 days) and max TTL for access tokens (e.g., ≤15m).
+
+Public key distribution to VMs:
+
+New VMs: use OpenStack keypair and set key_name on instance create (injected by cloud-init).
+
+Existing VMs: temporarily append public key to ~<user>/.ssh/authorized_keys via cloud-init user-data or Ansible (revert after the window).
+
+Persistent key holder: a dedicated service account generates and owns the keypair; humans only read via approved break-glass.
+
+1) Prepare Vault
+
+Enable a secrets engine (KV v2) and create a path, e.g. kv/breakglass/ssh/<env>/<scope>.
+
+Write a minimal policy:
+
+Writer (service account): create, update on kv/data/breakglass/ssh/...
+
+Reader (on-call role): read on that path only.
+
+Create:
+
+AppRole / OIDC role for the service account (to write).
+
+A break-glass role with short TTL (to read) and MFA/approval in your process.
+
+Turn on audit device (e.g., file or socket) if not already.
+
+2) Prepare OpenStack (SCI)
+
+Create an application credential or user for the service account with minimum scopes to:
+
+create/delete keypairs,
+
+(optionally) list servers (if you’ll target existing VMs).
+
+Record and store those OpenStack creds in Vault under a separate path (do not hardcode in scripts).
+
+3) Generate the keypair (service account host)
+umask 077
+ssh-keygen -t ed25519 -a 100 -C "breakglass@<env>" -f ./breakglass_<env>_ed25519
+# Files: breakglass_<env>_ed25519 (private), breakglass_<env>_ed25519.pub (public)
+
+4) Register the public key in OpenStack
+openstack keypair create --public-key breakglass_<env>_ed25519.pub breakglass-<env>
+# Verify
+openstack keypair show breakglass-<env>
+
+5) Store the private key in Vault (never on disk beyond source if possible)
+vault kv put kv/breakglass/ssh/<env>/default \
+  private_key="$(cat breakglass_<env>_ed25519)" \
+  public_key="$(cat breakglass_<env>_ed25519.pub)" \
+  format="ed25519" owner="svc-breakglass" rotation_days="60"
+
+
+For delivery, use response wrapping:
+
+vault kv get -wrap-ttl=15m kv/breakglass/ssh/<env>/default
+# returns a single-use wrapping token for the on-call
+
+6) Make the key effective on VMs
+
+New instances: set --key-name breakglass-<env> when creating servers; cloud-init puts it into authorized_keys.
+
+Existing instances (time-boxed):
+
+If you have config management access:
+Append to ~<user>/.ssh/authorized_keys and remove after the incident.
+
+If you don’t: rebuild with the keypair or use console + cloud-init user-data (last resort).
+
+7) Break-glass use procedure (people/process)
+
+Incident declared → approval captured (ticket).
+
+On-call receives response-wrapped token (15m TTL).
+
+On-call unwraps, retrieves the private key, uses it via bastion with full session logging:
+
+ssh -i ./breakglass_<env>_ed25519 <user>@<target> -J <bastion>
+
+
+After action:
+
+remove the public key from any temporary placements,
+
+rotate the pair if it was used (recommended) and update Vault + keypair,
+
+attach audit notes to the ticket.
+
+8) Rotation & revocation
+
+Rotation = generate new pair, update OpenStack keypair (delete old, create new), update Vault secret, redeploy/refresh instances to pick up the new key (or temporarily add both during a window).
+
+Revoke = delete keypair in OpenStack + invalidate Vault secret + disable reader roles.
+
+Automation patterns (choose the one that fits)
+
+Golden rule: Never let Terraform state store your private key.
+The tls_private_key resource will put the private key into state. For break-glass, generate/stash the private key outside Terraform (Python/Bash) → pass only the public key into Terraform → write the private key directly to Vault via script/Ansible.
+
+A) Terraform for keypair + Vault for storage (safe state)
+
+What Terraform does
+
+Creates/updates the OpenStack keypair (public key only).
+
+Optionally tags new servers to use key_name = breakglass-<env>.
+
+What a companion script does
+
+Generates keypair.
+
+Writes private key to Vault (KV v2) with metadata & wrapping.
+
+Minimal Terraform (OpenStack + input var for pubkey)
+terraform {
+  required_providers {
+    openstack = { source = "terraform-provider-openstack/openstack" }
+  }
+}
+
+provider "openstack" {
+  # Use OS_* env vars or cloud config; never hardcode secrets
+}
+
+variable "breakglass_public_key" {
+  type        = string
+  description = "ED25519 public key material"
+}
+
+resource "openstack_compute_keypair_v2" "breakglass" {
+  name       = "breakglass-${var.env}"
+  public_key = var.breakglass_public_key
+}
+
+# Example new server using the break-glass keypair
+resource "openstack_compute_instance_v2" "vm" {
+  name            = "example-01"
+  image_name      = var.image
+  flavor_name     = var.flavor
+  key_pair        = openstack_compute_keypair_v2.breakglass.name
+  network {
+    uuid = var.network_id
+  }
+}
+
+Python (generate + store to Vault) — run before terraform apply
+# pip install cryptography hvac
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives import serialization
+import hvac, os, json, sys, getpass
+
+env = os.environ.get("ENV","dev")
+vault_addr = os.environ["VAULT_ADDR"]
+vault_token = os.environ["VAULT_TOKEN"]  # AppRole/JWT in CI recommended
+
+# 1) Generate key
+priv = ed25519.Ed25519PrivateKey.generate()
+pub  = priv.public_key()
+
+priv_pem = priv.private_bytes(
+    serialization.Encoding.PEM,
+    serialization.PrivateFormat.OpenSSH,
+    serialization.NoEncryption()
+).decode()
+
+pub_ssh = pub.public_bytes(
+    serialization.Encoding.OpenSSH,
+    serialization.PublicFormat.OpenSSH
+).decode()
+
+# 2) Store private key in Vault
+client = hvac.Client(url=vault_addr, token=vault_token)
+path = f"kv/breakglass/ssh/{env}/default"
+client.secrets.kv.v2.create_or_update_secret(
+    path=path.replace("kv/",""),   # hvac expects path without mount prefix
+    secret={"private_key": priv_pem, "public_key": pub_ssh, "format":"ed25519"}
+)
+
+# 3) Emit public key for Terraform var injection (stdout)
+print(pub_ssh)
+
+
+Usage:
+
+export VAULT_ADDR=https://vault.example.com
+export VAULT_TOKEN=<svc token>
+PUB=$(python3 gen_and_store_breakglass.py)
+terraform apply -var="breakglass_public_key=$PUB" -var="env=dev"
+
+B) Terraform + Ansible (for existing VMs)
+
+Use Terraform only to manage the keypair object.
+
+Use Ansible with the openstack.cloud inventory plugin to find VMs and ansible.posix.authorized_key to append/remove the key during a break-glass window.
+
+ansible.cfg
+
+[inventory]
+enable_plugins = openstack.cloud.openstack
+
+
+inventory.openstack.yml
+
+plugin: openstack.cloud.openstack
+expand_hostvars: true
+
+
+playbook.yml
+
+- hosts: all
+  gather_facts: false
+  vars:
+    user: ubuntu
+    breakglass_pubkey: "{{ lookup('env', 'BREAKGLASS_PUB') }}"
+  tasks:
+    - name: Add break-glass key (time-boxed)
+      ansible.posix.authorized_key:
+        user: "{{ user }}"
+        key: "{{ breakglass_pubkey }}"
+        state: present
+    # ... later, remove:
+    # - ansible.posix.authorized_key: user={{user}} key={{breakglass_pubkey}} state=absent
+
+
+Run:
+
+export OS_*=...           # your SCI OpenStack creds
+export BREAKGLASS_PUB="$(vault kv get -field=public_key kv/breakglass/ssh/dev/default)"
+ansible-playbook -i inventory.openstack.yml playbook.yml
+
+C) All-script path (Python or Bash only)
+
+Python (using openstacksdk + hvac) can:
+
+Generate ED25519
+
+Store private key in Vault (KV v2)
+
+Create/update OpenStack keypair
+
+(Optional) Append to authorized_keys over SSH for specific hosts, then remove.
+
+Bash (curl + openstack CLI + jq):
+
+Similar flow; just be careful with quoting and secure temp files (use mktemp, umask 077).
+
+Break-glass operational workflow (put it in your runbook)
+
+Trigger & Approval
+
+Incident declared; ticket opened; approver signs off.
+
+Key access
+
+Ops lead generates a wrapped response for kv/breakglass/ssh/<env>/default (15m TTL) and gives the wrapping token to on-call.
+
+Use
+
+On-call unwraps, retrieves the key, connects through bastion with session logging. Limit to specific user (e.g., ubuntu or cloud-user).
+
+Aftercare
+
+Remove any temporary authorized_keys entries.
+
+Rotate the break-glass keypair if used (best practice): generate new pair, update Vault, update OpenStack keypair, roll instances.
+
+Attach Vault and bastion logs to the ticket.
+
+Guardrails & tips
+
+Do not use tls_private_key in Terraform for this use case — it will persist the private key in state.
+
+Prefer Vault SSH CA (signed-SSH certificates) if your policy allows it: zero static key distribution, short-lived certs. If you want, I’ll sketch that variant next.
+
+Enforce Just-In-Time read: short-lived Vault tokens, response wrapping, and an approval gate.
+
+Centralize entry via a bastion (session recording), and disable direct internet SSH.
+
+Tag VMs with breakglass=enabled and scope Ansible to those only.
+
+Document the RTO for key activation (e.g., <10 minutes) and test quarterly.
