@@ -1,0 +1,765 @@
+Here’s a concise version of the Jira wording — perfect for standard Jira fields when there isn’t much space:
+
+---
+
+### **Summary:**
+
+Windows VMs on SAP SCI OpenStack fail domain join due to incorrect DNS suffix search list in base image.
+
+---
+
+### **Description:**
+
+New Windows VMs deployed from the SAP SCI base image contain a preconfigured DNS suffix search list that causes multiple lookup retries and timeouts when attempting to locate domain controllers. This results in domain join failures or long delays during provisioning.
+
+**Symptoms:**
+
+* Domain join hangs at “locating DC” or times out.
+* DNS lookups show irrelevant suffixes being queried.
+* Manual DNS correction resolves the issue.
+
+**Root Cause:**
+SAP-provided image has an incorrect static DNS suffix list under `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\SearchList`.
+
+**Workaround / Resolution Plan:**
+Implement runtime correction (no image change required):
+
+1. Run PowerShell bootstrap (via user-data or RDP) to reset DNS servers, fix suffix list, and enable WinRM HTTPS.
+2. Use Ansible (WinRM) to apply DNS fix role and perform domain join.
+3. Apply GPO to enforce DNS settings after join.
+
+**Acceptance Criteria:**
+
+* VMs join domain successfully without manual DNS edits.
+* Correct DNS servers and suffix list applied automatically.
+* GPO maintains settings post-join.
+
+**Priority:** High (blocks automation)
+
+---
+
+Would you like me to tailor this further for a specific Jira template (e.g., **“Change Request,” “Bug,”** or **“Task”** type)?
+That way I can include the correct tone and section headers Jira expects for your workflow.
+
+
++++++++++++++++++++++++++++++++++
+Perfect — you want the Jira ticket to clearly explain the **problem, impact, root cause, and proposed solution path**, so that platform, AD, and image teams all understand why you’re doing this and that you’re not trying to modify the image directly.
+
+Here’s an example Jira ticket draft (you can paste this into Jira and adjust formatting or fields as needed):
+
+---
+
+### **Title:**
+
+Windows VM DNS Suffix Issue Causing Domain Join Failures on SAP SCI Infrastructure
+
+---
+
+### **Description / Summary:**
+
+Windows virtual machines deployed from the **SAP SCI OpenStack-provided base image** are pre-configured with an incorrect or overly long **DNS suffix search list**. This configuration introduces delays and name-resolution timeouts during the **Active Directory domain join process**, as Windows attempts multiple unnecessary suffix queries before locating the correct domain controller (DC).
+
+As a result, domain join operations frequently fail or hang during the “locating DC” step, especially on first boot, impacting automation and post-deployment configuration workflows.
+
+---
+
+### **Observed Symptoms:**
+
+* Windows VMs fail to join the domain during provisioning.
+* Domain join hangs at “Attempting to locate DC” or times out.
+* DNS lookups show multiple suffixes being queried unnecessarily.
+* Manual correction of the DNS search list and DNS servers resolves the issue immediately.
+
+---
+
+### **Root Cause:**
+
+The **SAP-provided Windows image** contains a **hard-coded DNS suffix search list** within
+`HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\SearchList`.
+These suffixes are not relevant to our environment, causing DNS devolution and lookup retries that delay or prevent successful domain joins.
+
+---
+
+### **Impact / Business Justification:**
+
+* Domain-join automation (Ansible/Tower) is blocked until DNS settings are manually corrected.
+* Increased time and manual effort for each Windows deployment.
+* Inconsistent DNS configuration across Windows systems in the environment.
+* Delayed system readiness for application deployment and integration.
+
+---
+
+### **Proposed Resolution (Non-Image Workaround):**
+
+Implement a **runtime DNS correction and WinRM enablement** process without modifying the base image.
+
+**Key steps:**
+
+1. Run a one-time **PowerShell bootstrap script** (via user-data or first-boot) to:
+
+   * Reset DNS servers to corporate AD DNS.
+   * Override the invalid search list and disable DNS devolution.
+   * Enable WinRM HTTPS listener for Ansible management.
+2. Manage Windows systems via **Ansible over WinRM (HTTPS)** to:
+
+   * Re-apply DNS configuration consistently.
+   * Perform domain join automatically.
+3. Once joined, enforce DNS settings centrally using **Group Policy (GPO)** for long-term consistency.
+4. (Optional) Adjust SAP SCI subnet DHCP options for DNS servers and domain suffix if permitted.
+
+This approach avoids image modification while ensuring reliable, repeatable configuration and domain join success.
+
+---
+
+### **Deliverables / Work Items:**
+
+* [ ] PowerShell bootstrap script (user-data compatible)
+* [ ] Ansible role: `windows_dns_fix`
+* [ ] Tower job template for automated domain join
+* [ ] GPO configuration for DNS suffix search list
+* [ ] Test validation on two sample SAP SCI Windows VMs
+
+---
+
+### **Acceptance Criteria:**
+
+✅ New and existing Windows VMs can successfully join the AD domain without manual DNS adjustments.
+✅ DNS suffix search list reflects `corp.example.com, example.com`.
+✅ WinRM HTTPS is enabled by default for Ansible management.
+✅ GPO enforces correct suffix settings post-join.
+✅ Documented reproducible steps for future deployments.
+
+---
+
+### **Priority:**
+
+**High (P2)** — blocks automation and domain provisioning.
+
+### **Reporter:**
+
+<your name>
+
+### **Assignees / Collaborators:**
+
+* Cloud / SCI Platform Team
+* AD Infrastructure Team
+* Automation (Ansible / AAP) Team
+
+---
+
+Would you like me to format this into a **shorter Jira “Summary + Description” version** (for when Jira has limited formatting) or keep this **long-form “engineering case” version** for clarity when attaching it to a change request?
+
+----------------------------
+Got the transcript—no need to paste it here. From what you captured, the root problem is that the SAP SCI–supplied Windows images come pre-baked with an (overly long/wrong) DNS suffix search list. During domain join and normal name lookups, Windows tries those suffixes in order; the extra suffixes add delay and cause the 2–3 lookup attempts Windows makes during join to time out. You also discussed fixing this with a GPO so that any machine that successfully joins gets the suffix list “flushed”/corrected.
+
+Below are practical, testable solution paths—starting with what you prefer (Ansible), then PowerShell, then infra/image-level fixes—plus a “pick-one-now” recommendation at the end.
+
+# 1) Ansible (WinRM, no image change required)
+
+You absolutely can manage Windows with Ansible over WinRM (SSH isn’t required). In fact, the transcript’s concern that “Ansible against Windows relies on SSH” is what’s blocking you; use WinRM and you won’t need to modify the image just to add SSH.
+
+**How to proceed**
+
+* **Transport**: Set `ansible_connection=winrm` (HTTPS preferred), and provide credentials (local admin or a domain account after join).
+* **Bootstrap WinRM** (one-time on each image/VM):
+
+  * If Cloudbase-Init or userdata is available in SCI, run a tiny first-boot PowerShell to enable WinRM HTTPS and open the firewall.
+  * If you must RDP the first time, run a short WinRM enable script once, then hand over to Ansible.
+* **Playbook tasks**:
+
+  * Fix DNS client server list (`win_dns_client`).
+  * Set the DNS suffix **search list** and turn off devolution if needed (registry keys: `SearchList`, `UseDomainNameDevolution`).
+  * (Optional) Set the connection-specific DNS suffix on the NIC.
+  * Join domain with `win_domain_membership` (after DNS is correct).
+  * Reboot when prompted.
+
+**Ansible inventory example (HTTPS)**
+
+```
+[windows]
+vm1 ansible_host=10.0.0.10
+
+[windows:vars]
+ansible_user=Administrator
+ansible_password=SuperSecret!
+ansible_connection=winrm
+ansible_winrm_transport=basic
+ansible_winrm_scheme=https
+ansible_winrm_server_cert_validation=ignore
+```
+
+**Ansible playbook sketch**
+
+```yaml
+- hosts: windows
+  gather_facts: no
+  tasks:
+    - name: Ensure DNS servers are your AD DNS
+      win_dns_client:
+        adapter_names: '*'
+        ipv4_addresses:
+          - 10.10.0.10
+          - 10.10.0.11
+
+    - name: Set DNS suffix search order (global)
+      win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters
+        name: SearchList
+        data: "corp.example.com,example.com"
+        type: string
+
+    - name: Disable DNS devolution (optional)
+      win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters
+        name: UseDomainNameDevolution
+        data: 0
+        type: dword
+
+    - name: Set connection-specific DNS suffix (optional, per NIC)
+      win_shell: |
+        Get-DnsClient | % { Set-DnsClient -InterfaceIndex $_.InterfaceIndex -ConnectionSpecificSuffix "corp.example.com" -UseSuffixWhenRegistering $true }
+
+    - name: Restart networking (or reboot if joining domain next)
+      win_reboot:
+        msg: "Applying DNS changes"
+        reboot_timeout: 900
+
+    - name: Join domain
+      win_domain_membership:
+        dns_domain_name: corp.example.com
+        domain_admin_user: CORP\\svc_join
+        domain_admin_password: "{{ domain_join_password }}"
+        state: domain
+      register: domain_state
+
+    - name: Reboot after domain join if required
+      win_reboot:
+        when: domain_state.reboot_required
+```
+
+**Why this works for your stated pain:**
+It removes the baked-in long suffix chain that’s causing join-time lookup retries/timeouts, and it does so **before** join, so the join succeeds on the first pass. This mirrors the transcript’s plan to “flush this list” via policy but does it immediately per host via config management.
+
+# 2) PowerShell (direct, quick, test-friendly)
+
+If you’d rather test per-host first (or bootstrap for Ansible), PowerShell alone is enough:
+
+```powershell
+# Set DNS servers for all interfaces
+Get-DnsClientAdapter | ForEach-Object {
+  Set-DnsClientServerAddress -InterfaceIndex $_.InterfaceIndex -ServerAddresses 10.10.0.10,10.10.0.11
+}
+
+# Set global suffix search list (overrides devolution)
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name 'SearchList' -Value 'corp.example.com,example.com'
+
+# (Optional) disable devolution
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name 'UseDomainNameDevolution' -Type DWord -Value 0
+
+# (Optional) per-NIC connection-specific suffix and register
+Get-DnsClient | ForEach-Object {
+  Set-DnsClient -InterfaceIndex $_.InterfaceIndex -ConnectionSpecificSuffix 'corp.example.com' -UseSuffixWhenRegistering $true
+}
+
+# Domain join (after DNS fixed)
+Add-Computer -DomainName corp.example.com -Credential (Get-Credential CORP\svc_join) -Restart
+```
+
+CLI `netsh` equivalents exist if you’re in recovery mode, but PowerShell is cleaner and scriptable.
+
+# 3) GPO after join (policy-based “flush”)
+
+This is what you discussed live: use a **Group Policy** to control the DNS suffix search list (Computer Configuration → Policies → Administrative Templates → Network → DNS Client → “DNS Suffix Search List”) and optionally set primary & connection-specific suffix behavior. Once a machine **successfully** joins, the GPO applies and “flushes” the bad baked list on all subsequent boots. That matches the plan in your call.
+
+**Caveat:** it doesn’t help the *initial* join if that join is failing because of the suffix chain—so do a per-host pre-join fix once (PowerShell or Ansible), then let GPO enforce it going forward.
+
+# 4) Image-level fix (Packer/Template or Unattend)
+
+If you control the golden image:
+
+* Remove/override the bad search list in `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\SearchList`.
+* Consider a `SetupComplete.cmd` or first-logon task to set the correct suffix and DNS servers.
+* If these are Cloudbase-Init images, use its plugins/unattend to stamp the right DNS configuration on specialize/first-boot.
+
+This makes every new VM start clean, avoiding the long baked chain that caused the timeouts you saw.
+
+# 5) Network/DHCP-level in SCI (Neutron Subnet options)
+
+Where possible in SAP SCI/OpenStack:
+
+* Set the **subnet’s DNS nameservers** to your AD DNS IPs.
+* Set the **DNS domain** (option 15) and, if supported, the **search list** (option 119).
+* Make sure security groups and routing allow UDP/TCP 53 from the VMs to your AD DNS.
+  This pushes the correct DNS via DHCP so Windows picks it up automatically on boot, reducing the need for per-VM remediation.
+
+# 6) First-boot User-Data (cloud-init / Cloudbase-Init)
+
+If the platform lets you inject user data:
+
+* Provide a small PowerShell script (as in §2) that runs on first boot, fixes DNS servers and the search list, enables WinRM HTTPS (if you want Ansible later), and optionally performs the domain join.
+
+# 7) Offline Domain Join (ODJ) as a fallback
+
+If the **join step itself** is where you’re stuck (because DNS is flaky until fixed), you can:
+
+* Apply the DNS fixes first (PowerShell one-liner),
+* Then use `djoin.exe` with an offline blob to perform join without relying on live DNS SRV discovery during the critical window. (Still switch to the proper DNS afterward—and GPO will maintain it.)
+
+# 8) Clarification from the transcript worth noting
+
+* The team explicitly identified that SAP’s image has a hard-coded list of suffixes—causing the query chain, retries, and join timeouts.
+* You proposed a **GPO** to overwrite the suffix list post-join—good for steady state, not enough for first join without a one-time pre-join fix.
+* There was concern about using **Ansible** due to SSH; again, use **WinRM** for Windows and you can keep your “Ansible-first” preference.
+
+---
+
+## Recommended “do this now” path
+
+1. **One-time PS tweak on a test VM** (or via user data) to set DNS servers and a short, correct suffix search list; then **join**.
+2. **Enable WinRM HTTPS** in that same step so you can manage it with **Ansible** moving forward.
+3. After the first successful join, let a **GPO** enforce the correct suffix list org-wide.
+4. In parallel, fix **SCI subnet DNS** (if you have that control) and plan an **image bake** so new VMs are born correct.
+
+That will solve the immediate timeouts and also close the loop so you don’t fight this again.
+
+If you want, I can turn the above into:
+
+* a copy-paste **PowerShell** bootstrap (first-boot),
+* a minimal **Ansible** role (`win_dns_client`, registry edits, domain join),
+* a **GPO** settings checklist,
+* and a short **SCI subnet** change checklist.
+
+
+++++++++++++++++++++++++++++++++++++++
+
+Perfect — that makes total sense, and you’re approaching this the right way.
+
+Since image modification (Step #4) is off the table, we’ll optimize your plan to **fix DNS and suffix settings at runtime**, using **PowerShell first** and then **Ansible over WinRM** once connectivity is stable. This gives you an entirely *agentless*, *non-disruptive*, and *repeatable* workflow — no image rebuilds needed.
+
+---
+
+## ✅ Revised, Image-Independent Implementation Plan
+
+### **Step 1 — Quick PowerShell Bootstrap (run once manually or via userdata)**
+
+Use this on any fresh SCI Windows VM **before domain join**:
+
+```powershell
+# 1. Set proper DNS servers
+Get-DnsClientAdapter | ForEach-Object {
+    Set-DnsClientServerAddress -InterfaceIndex $_.InterfaceIndex -ServerAddresses 10.10.0.10,10.10.0.11
+}
+
+# 2. Clean up the bad search list and set correct suffixes
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+    -Name 'SearchList' -Value 'corp.example.com,example.com'
+
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+    -Name 'UseDomainNameDevolution' -Type DWord -Value 0
+
+# 3. Optional: tag NICs with the correct connection-specific suffix
+Get-DnsClient | ForEach-Object {
+    Set-DnsClient -InterfaceIndex $_.InterfaceIndex -ConnectionSpecificSuffix 'corp.example.com' `
+        -UseSuffixWhenRegistering $true
+}
+
+# 4. Enable WinRM for Ansible control (HTTPS listener)
+winrm quickconfig -q
+winrm set winrm/config/service/Auth '@{Basic="true"}'
+winrm set winrm/config/service '@{AllowUnencrypted="false"}'
+New-Item -Path WSMan:\Localhost\ClientCertificate -Force | Out-Null
+Set-Item WSMan:\localhost\Service\AllowUnencrypted $false
+Enable-PSRemoting -Force
+
+# 5. (Optional) Join domain if you want to test pre-Ansible
+# Add-Computer -DomainName corp.example.com -Credential (Get-Credential) -Restart
+```
+
+> 💡 You can paste that directly into an RDP session, or inject it as **user-data / Cloudbase-Init PowerShell** so the VM comes up pre-fixed.
+
+---
+
+### **Step 2 — Enable Ansible Management via WinRM**
+
+Now you can manage it from your control node (Linux, Mac, or Ansible Tower/AAP2):
+
+```ini
+[windows]
+sapwin01 ansible_host=10.10.0.25
+
+[windows:vars]
+ansible_user=Administrator
+ansible_password=YourPasswordHere
+ansible_connection=winrm
+ansible_winrm_transport=basic
+ansible_winrm_scheme=https
+ansible_winrm_server_cert_validation=ignore
+```
+
+---
+
+### **Step 3 — Push DNS & Domain Join with Ansible**
+
+Your reusable playbook (you can name it `fix-dns.yml`):
+
+```yaml
+- hosts: windows
+  gather_facts: no
+  tasks:
+    - name: Set correct DNS servers
+      win_dns_client:
+        adapter_names: '*'
+        ipv4_addresses:
+          - 10.10.0.10
+          - 10.10.0.11
+
+    - name: Set DNS search list and disable devolution
+      win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters
+        name: SearchList
+        data: "corp.example.com,example.com"
+        type: string
+
+    - name: Disable DNS devolution
+      win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters
+        name: UseDomainNameDevolution
+        data: 0
+        type: dword
+
+    - name: Optional: Set connection-specific suffix
+      win_shell: |
+        Get-DnsClient | % { Set-DnsClient -InterfaceIndex $_.InterfaceIndex -ConnectionSpecificSuffix "corp.example.com" -UseSuffixWhenRegistering $true }
+
+    - name: Reboot to apply DNS changes
+      win_reboot:
+        msg: "Applying DNS configuration..."
+        reboot_timeout: 600
+
+    - name: Join the domain (after reboot)
+      win_domain_membership:
+        dns_domain_name: corp.example.com
+        domain_admin_user: CORP\\svc_join
+        domain_admin_password: "{{ domain_join_password }}"
+        state: domain
+      register: join_result
+
+    - name: Reboot again if required
+      win_reboot:
+        when: join_result.reboot_required
+```
+
+> 🧩 Once this works on one VM, you can scale it to all Windows instances in your SCI tenant.
+> 💡 You can also add a “first-boot” tag (metadata or naming convention) to auto-target only unjoined systems.
+
+---
+
+### **Step 4 — Use GPO to Keep It Fixed**
+
+Once machines are domain-joined, let GPO enforce the correct DNS suffix list and devolution setting:
+
+`Computer Configuration → Policies → Administrative Templates → Network → DNS Client → “DNS Suffix Search List”`
+
+That ensures future boots or NIC refreshes don’t revert to the baked image defaults.
+
+---
+
+### **Step 5 — Optional Automation (Cloudbase-Init or Tower)**
+
+If Cloudbase-Init is already used in SCI:
+
+* You can push that PowerShell snippet as *user data*, so every Windows VM comes up ready for Ansible without touching the image.
+* Or wrap the bootstrap + Ansible execution in an **Ansible Tower job template** triggered on VM create events.
+
+---
+
+### **Summary of Your Effective Path (No Image Change)**
+
+| Phase             | Action                                   | Tool                   | Who Runs It |
+| ----------------- | ---------------------------------------- | ---------------------- | ----------- |
+| Bootstrap         | Run PowerShell to fix DNS & enable WinRM | PowerShell / user-data | You         |
+| Config Mgmt       | Apply DNS + join domain                  | Ansible (WinRM)        | You         |
+| Long-term Policy  | Enforce via GPO                          | AD Team                | AD Admins   |
+| Future Automation | Integrate with Cloudbase-Init or AAP     | You / DevOps           | Optional    |
+
+---
+
+If you’d like, I can now package this into a **single-file Ansible Role** (`roles/windows_dns_fix/`) with defaults and handlers, or generate the **user-data PowerShell block** formatted for SAP SCI’s instance creation form.
+Would you like me to build that next?
+
+---------------------------------
+Awesome—here are both deliverables, ready to use without touching the base image:
+
+---
+
+# 1) Minimal Ansible role: `windows_dns_fix`
+
+A tiny, reusable role that (a) fixes DNS servers, (b) sets a clean DNS suffix search list, (c) optionally disables devolution, (d) (optionally) tags the NIC with a connection-specific suffix, and (e) leaves domain join to whatever you run next.
+
+### File layout
+
+```
+roles/
+└─ windows_dns_fix/
+   ├─ defaults/
+   │  └─ main.yml
+   └─ tasks/
+      └─ main.yml
+```
+
+### `roles/windows_dns_fix/defaults/main.yml`
+
+```yaml
+# Default variables (override in your play or inventory)
+
+# AD DNS servers to use
+windows_dns_servers_ipv4:
+  - 10.10.0.10
+  - 10.10.0.11
+
+# Suffix search list you want everywhere (comma-separated string)
+windows_dns_search_list: "corp.example.com,example.com"
+
+# Disable Windows DNS devolution? (recommended when using explicit SearchList)
+windows_dns_disable_devolution: true
+
+# Optional: apply a per-NIC connection-specific suffix & register
+windows_dns_connection_specific_suffix: "corp.example.com"
+windows_dns_set_connection_specific_suffix: true
+
+# Reboot after making changes (recommended)
+windows_dns_require_reboot: true
+```
+
+### `roles/windows_dns_fix/tasks/main.yml`
+
+```yaml
+---
+- name: Ensure correct DNS servers on all adapters
+  win_dns_client:
+    adapter_names: '*'
+    ipv4_addresses: "{{ windows_dns_servers_ipv4 }}"
+
+- name: Set global DNS suffix search list
+  win_regedit:
+    path: HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters
+    name: SearchList
+    data: "{{ windows_dns_search_list }}"
+    type: string
+
+- name: Disable DNS devolution (optional)
+  win_regedit:
+    path: HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters
+    name: UseDomainNameDevolution
+    data: "{{ 0 if windows_dns_disable_devolution else 1 }}"
+    type: dword
+
+- name: Optionally set per-NIC connection-specific suffix and register
+  win_shell: |
+    $suffix = "{{ windows_dns_connection_specific_suffix }}"
+    Get-DnsClient | ForEach-Object {
+      Set-DnsClient -InterfaceIndex $_.InterfaceIndex `
+        -ConnectionSpecificSuffix $suffix `
+        -UseSuffixWhenRegistering $true
+    }
+  when: windows_dns_set_connection_specific_suffix
+
+- name: Reboot to apply DNS changes
+  win_reboot:
+    msg: "Applying DNS configuration..."
+    reboot_timeout: 1200
+  when: windows_dns_require_reboot
+```
+
+### Example play to run the role + join domain afterward
+
+```yaml
+# fix-dns-and-join.yml
+- hosts: windows
+  gather_facts: no
+  vars:
+    windows_dns_servers_ipv4: [10.10.0.10, 10.10.0.11]
+    windows_dns_search_list: "corp.example.com,example.com"
+    domain_name: "corp.example.com"
+    domain_join_user: "CORP\\svc_join"
+    domain_join_password: "{{ vault_domain_join_password }}"
+  tasks:
+    - name: Apply DNS fix role
+      ansible.builtin.import_role:
+        name: windows_dns_fix
+
+    - name: Join the domain (requires correct DNS)
+      ansible.windows.win_domain_membership:
+        dns_domain_name: "{{ domain_name }}"
+        domain_admin_user: "{{ domain_join_user }}"
+        domain_admin_password: "{{ domain_join_password }}"
+        state: domain
+      register: join_result
+
+    - name: Reboot if domain join requires it
+      ansible.windows.win_reboot:
+        msg: "Rebooting after domain join..."
+        reboot_timeout: 1800
+      when: join_result.reboot_required | default(false)
+```
+
+### Inventory (WinRM over HTTPS, no image change required)
+
+```ini
+[windows]
+sapwin01 ansible_host=10.10.0.25
+
+[windows:vars]
+ansible_user=Administrator
+ansible_password=SuperSecret!
+ansible_connection=winrm
+ansible_winrm_transport=basic
+ansible_winrm_scheme=https
+ansible_winrm_server_cert_validation=ignore
+```
+
+> Tip: Run your **one-time** bootstrap (below) once, then everything is Ansible from there on.
+
+---
+
+# 2) Cloudbase-Init / User-Data bootstrap (PowerShell)
+
+Use this when you create the VM in SAP SCI. It **fixes DNS** and **enables WinRM/HTTPS** for Ansible—no domain join here (keep that in Ansible).
+
+### Option A — Plain PowerShell user-data (`#ps1`)
+
+Paste this as the instance’s user-data:
+
+```powershell
+#ps1
+# --- CONFIG: edit these for your environment ---
+$DnsServers   = @('10.10.0.10','10.10.0.11')
+$SearchList   = 'corp.example.com,example.com'
+$ConnSuffix   = 'corp.example.com'
+$SetConnSuffix = $true
+$DisableDevolution = $true
+# -----------------------------------------------
+
+Write-Host "Setting DNS servers on all adapters..."
+Get-NetAdapter -Physical | ForEach-Object {
+    Try {
+        Set-DnsClientServerAddress -InterfaceAlias $_.Name -ServerAddresses $DnsServers -ErrorAction Stop
+    } Catch {
+        Write-Warning "Failed to set DNS on $($_.Name): $($_.Exception.Message)"
+    }
+}
+
+Write-Host "Setting global SearchList and devolution..."
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name 'SearchList' -Value $SearchList
+if ($DisableDevolution) {
+    New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name 'UseDomainNameDevolution' -PropertyType DWord -Value 0 -Force | Out-Null
+}
+
+if ($SetConnSuffix) {
+    Write-Host "Applying connection-specific suffix..."
+    Get-DnsClient | ForEach-Object {
+        Try {
+            Set-DnsClient -InterfaceIndex $_.InterfaceIndex -ConnectionSpecificSuffix $ConnSuffix -UseSuffixWhenRegistering $true
+        } Catch {
+            Write-Warning "Failed to set connection suffix on index $($_.InterfaceIndex): $($_.Exception.Message)"
+        }
+    }
+}
+
+Write-Host "Enabling WinRM over HTTPS for Ansible..."
+# Create self-signed cert and HTTPS listener
+$cert = New-SelfSignedCertificate -DnsName $env:COMPUTERNAME `
+    -CertStoreLocation Cert:\LocalMachine\My
+
+# Remove any existing HTTPS listeners (if any), then create one
+Try { winrm delete winrm/config/Listener?Address=*+Transport=HTTPS | Out-Null } Catch {}
+winrm create winrm/config/Listener?Address=*+Transport=HTTPS "@{Hostname=`"$env:COMPUTERNAME`"; CertificateThumbprint=`"$($cert.Thumbprint)`"}" | Out-Null
+
+# Harden WinRM: Basic on (Ansible), no unencrypted, and allow remote
+winrm set winrm/config/service '@{AllowUnencrypted="false"}' | Out-Null
+winrm set winrm/config/service/Auth '@{Basic="true"; Kerberos="true"; Negotiate="true"}' | Out-Null
+Enable-PSRemoting -Force | Out-Null
+
+# Open firewall for WinRM HTTPS (5986)
+$rule = Get-NetFirewallRule -DisplayName "WINRM-HTTPS-In" -ErrorAction SilentlyContinue
+if (-not $rule) {
+    New-NetFirewallRule -DisplayName "WINRM-HTTPS-In" -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow | Out-Null
+}
+
+Write-Host "DNS fix + WinRM HTTPS bootstrap complete."
+# Optional: reboot to ensure all DNS client settings are applied
+shutdown.exe /r /t 5 /c "Rebooting to finalize DNS settings"
+```
+
+### Option B — Cloudbase-Init cloud-config (YAML)
+
+If your SCI console prefers cloud-config format:
+
+```yaml
+#cloud-config
+write_files:
+  - path: C:\ProgramData\Cloudbase Solutions\Scripts\bootstrap-dns-winrm.ps1
+    content: |
+      $DnsServers   = @('10.10.0.10','10.10.0.11')
+      $SearchList   = 'corp.example.com,example.com'
+      $ConnSuffix   = 'corp.example.com'
+      $SetConnSuffix = $true
+      $DisableDevolution = $true
+
+      Get-NetAdapter -Physical | % { Set-DnsClientServerAddress -InterfaceAlias $_.Name -ServerAddresses $DnsServers }
+      Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name 'SearchList' -Value $SearchList
+      if ($DisableDevolution) { New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name 'UseDomainNameDevolution' -PropertyType DWord -Value 0 -Force | Out-Null }
+      if ($SetConnSuffix) { Get-DnsClient | % { Set-DnsClient -InterfaceIndex $_.InterfaceIndex -ConnectionSpecificSuffix $ConnSuffix -UseSuffixWhenRegistering $true } }
+
+      $cert = New-SelfSignedCertificate -DnsName $env:COMPUTERNAME -CertStoreLocation Cert:\LocalMachine\My
+      Try { winrm delete winrm/config/Listener?Address=*+Transport=HTTPS | Out-Null } Catch {}
+      winrm create winrm/config/Listener?Address=*+Transport=HTTPS "@{Hostname=`"$env:COMPUTERNAME`"; CertificateThumbprint=`"$($cert.Thumbprint)`"}" | Out-Null
+      winrm set winrm/config/service '@{AllowUnencrypted="false"}' | Out-Null
+      winrm set winrm/config/service/Auth '@{Basic="true"; Kerberos="true"; Negotiate="true"}' | Out-Null
+      Enable-PSRemoting -Force | Out-Null
+      if (-not (Get-NetFirewallRule -DisplayName "WINRM-HTTPS-In" -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -DisplayName "WINRM-HTTPS-In" -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow | Out-Null
+      }
+      shutdown.exe /r /t 5 /c "Rebooting to finalize DNS settings"
+
+powershell:
+  - "C:\\ProgramData\\Cloudbase Solutions\\Scripts\\bootstrap-dns-winrm.ps1"
+```
+
+---
+
+## How to roll this out quickly
+
+1. **Create one test VM** with the PowerShell user-data above.
+2. After it reboots, confirm:
+
+   * `ipconfig /all` shows your DNS servers and search list,
+   * `winrm enumerate winrm/config/listener` shows an **HTTPS** listener on 5986.
+3. Run the **Ansible play** using the `windows_dns_fix` role, then the `win_domain_membership` task.
+4. Once joined, push a **GPO** for “DNS Suffix Search List” so future drift is auto-corrected.
+
+If you want, I can also hand you:
+
+* a Tower/AAP **Job Template** variable set,
+* a one-page **GPO checklist** you can send to AD ops,
+* or a tiny **“discover & target only unjoined Windows”** play to safely scale this out.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
