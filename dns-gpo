@@ -716,4 +716,102 @@ If you really want, I can also:
 * Or generate a **second script** that takes an existing backup and restores it on another domain automatically.
 
 
+++++++++++++++++++++++++++++++++++++++++++++++++
+Great question—and this is one where Windows is annoyingly particular.
+
+I can’t give you a **single XML file** you can just paste somewhere and “Import GPO” — GPMC backups are actually a **folder structure** with multiple files (including XML) that GPMC generates itself.
+
+What I *can* do is give you a **PowerShell script** that:
+
+1. Creates the GPO with the **exact DNS settings** we discussed
+2. Backs it up to a folder
+3. That folder is a valid **GPO backup** you can import on any other DC/forest using GPMC (“Manage Backups / Restore”)
+
+---
+
+## 🔧 PowerShell: Create GPO + Backup It (This Produces the XML You Want)
+
+Run this from a domain-joined server/workstation with GPMC/RSAT and appropriate rights:
+
+```powershell
+# ===== CONFIGURE THESE VALUES =====
+$GpoName    = "Fix DNS Suffix SearchList"
+$BackupPath = "C:\GPO-Backups\Fix-DNS-Suffix"
+$SearchList = "corp.example.com"   # <- your domain suffix
+# ==================================
+
+Import-Module GroupPolicy
+
+# 1. Create GPO if it doesn't exist yet
+$gpo = Get-GPO -Name $GpoName -ErrorAction SilentlyContinue
+if (-not $gpo) {
+    Write-Host "Creating new GPO: $GpoName"
+    $gpo = New-GPO -Name $GpoName
+} else {
+    Write-Host "GPO already exists: $GpoName (GUID: $($gpo.Id))"
+}
+
+# 2. Set DNS Suffix Search List via policy registry (DNS Client)
+# This mimics the "DNS Suffix Search List" Admin Template setting
+$policyKey = "HKLM\Software\Policies\Microsoft\Windows NT\DNSClient"
+
+Set-GPRegistryValue -Name $GpoName `
+    -Key $policyKey `
+    -ValueName "SearchList" `
+    -Type String `
+    -Value $SearchList
+
+# 3. Disable DNS devolution (UseDomainNameDevolution = 0)
+Set-GPRegistryValue -Name $GpoName `
+    -Key $policyKey `
+    -ValueName "UseDomainNameDevolution" `
+    -Type DWord `
+    -Value 0
+
+# 4. Create backup folder if needed
+if (-not (Test-Path $BackupPath)) {
+    New-Item -Path $BackupPath -ItemType Directory | Out-Null
+}
+
+# 5. Backup the GPO (this creates the XML + manifest)
+Write-Host "Backing up GPO '$GpoName' to '$BackupPath'..."
+Backup-GPO -Name $GpoName -Path $BackupPath -Comment "Fix DNS suffix search list and disable devolution"
+
+Write-Host "Done. GPO backup created at: $BackupPath"
+```
+
+### What this gives you
+
+* A folder like:
+
+  ```
+  C:\GPO-Backups\Fix-DNS-Suffix\{GPO-GUID-HERE}
+  ```
+* Inside it you’ll see files like:
+
+  * `Backup.xml`
+  * `GPO.xml`
+  * `MACHINE\...`
+* That folder is a **valid GPO backup** as if you’d done “Back Up” from GPMC by hand.
+
+---
+
+## 🧪 How to import this backup on another environment
+
+On the **target domain** (with GPMC):
+
+1. Open **Group Policy Management** (`gpmc.msc`)
+2. Right-click **Group Policy Objects** → **Manage Backups…**
+3. Point it at your backup path (e.g., copied from `C:\GPO-Backups\Fix-DNS-Suffix`)
+4. Select the `Fix DNS Suffix SearchList` backup
+5. Click **Restore…** or **Copy…** as needed
+
+Then link it to your server OU as we described earlier.
+
+---
+
+If you really want, I can also:
+
+* Add to the script: **auto-link the GPO** to a specific OU
+* Or generate a **second script** that takes an existing backup and restores it on another domain automatically.
 
