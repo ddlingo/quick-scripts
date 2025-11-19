@@ -375,8 +375,345 @@ ansible windows -i inventory.ini -m ansible.windows.win_shell \
 If you want a version that also **disables DNS devolution** or a version that **sets per-NIC connection-specific suffix**, I can give you that too.
 
 
+Below is a **clean, complete, step-by-step guide** to create and deploy a **GPO that enforces a DNS suffix search list** on Windows servers *after they join the domain*.
+
+This includes **exact clicks**, **paths**, and **settings**.
+
+---
+
+# ✅ **STEP 1 — Open Group Policy Management Console (GPMC)**
+
+On a workstation or server with RSAT or GPMC installed:
+
+1. Press **Win + R**
+2. Type:
+
+```
+gpmc.msc
+```
+
+3. Press **Enter**
+
+This opens **Group Policy Management** — the **ONLY** tool used for creating/editing GPOs.
+
+---
+
+# ✅ **STEP 2 — Create a new GPO**
+
+Inside GPMC:
+
+1. Expand your domain:
+
+```
+Forest → Domains → YOURDOMAIN
+```
+
+2. Right-click **Group Policy Objects**
+3. Click **New…**
+4. Name the GPO:
+
+```
+Fix DNS Suffix SearchList
+```
+
+5. Click **OK**
+
+---
+
+# ✅ **STEP 3 — Edit the GPO and set DNS suffix policy**
+
+Now:
+
+1. Right-click the new GPO (`Fix DNS Suffix SearchList`)
+2. Click **Edit**
+
+In the GPO Editor:
+
+### Navigate to:
+
+```
+Computer Configuration
+    → Policies
+        → Administrative Templates
+            → Network
+                → DNS Client
+```
+
+### Configure these two policies:
+
+---
+
+## **1. DNS Suffix Search List**
+
+* Double-click **DNS Suffix Search List**
+* Set to **Enabled**
+* In the text box, enter:
+
+```
+corp.example.com
+```
+
+(or whatever your correct DNS domain is)
+
+Click **Apply** → **OK**
+
+---
+
+## **2. Primary DNS Suffix Devolution**
+
+* Double-click **Primary DNS Suffix Devolution**
+* Set to **Disabled**
+* Click **Apply** → **OK**
+
+This prevents Windows from adding unintended suffixes.
+
+---
+
+# (Optional / If required)
+
+If you prefer to use **Registry Preferences** instead of the built-in DNS Client policy:
+
+Path:
+
+```
+Computer Configuration → Preferences → Windows Settings → Registry
+```
+
+Add two registry entries:
+
+* `HKLM\System\CurrentControlSet\Services\Tcpip\Parameters\SearchList`
+* `HKLM\System\CurrentControlSet\Services\Tcpip\Parameters\UseDomainNameDevolution`
+
+But the **built-in DNS Client policy is cleaner**, so use that unless instructed otherwise.
+
+---
+
+# ✅ **STEP 4 — Link the GPO to the proper OU**
+
+To apply the GPO to your servers:
+
+1. In GPMC, find the OU where your SCI Windows servers reside
+   Example:
+
+```
+Servers
+SCI-Windows
+Compute-Nodes
+Production-Servers
+```
+
+2. Right-click the OU
+3. Click **Link an Existing GPO…**
+4. Select:
+
+```
+Fix DNS Suffix SearchList
+```
+
+5. Click **OK**
+
+---
+
+# 🔥 **IMPORTANT**
+
+**GPOs MUST be linked at the OU level where the *computer objects* live.**
+
+✔ Linking to a user OU = useless
+✔ Linking to the domain root = applies to everything (not recommended)
+✔ Linking to the server OU = correct
+
+---
+
+# ✅ **STEP 5 — Move servers into that OU (if not already)**
+
+Use **Active Directory Users and Computers (ADUC)**:
+
+1. Open:
+
+```
+dsa.msc
+```
+
+2. Locate the server (search if needed):
+   Right-click the domain → **Find** → type hostname
+
+3. Drag the server into the OU where the GPO is linked
+   (Or right-click → **Move…**)
+
+---
+
+# ✅ **STEP 6 — Force the servers to apply the new GPO**
+
+On the Windows VM:
+
+### Run:
+
+```
+gpupdate /force
+```
+
+If you prefer remote Ansible:
+
+```bash
+ansible windows -m ansible.windows.win_shell -a "gpupdate /force" -i inventory.ini
+```
+
+Restart may be required depending on whether devolution settings were previously applied.
+
+---
+
+# ✅ **STEP 7 — Validate the DNS Suffix SearchList**
+
+On the server:
+
+### Registry validation:
+
+```
+reg query HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters /v SearchList
+```
+
+Expected:
+
+```
+SearchList    REG_SZ    corp.example.com
+```
+
+### GPO validation:
+
+```
+gpresult /r /scope computer
+```
+
+Under **Applied Group Policy Objects**, you should see:
+
+```
+Fix DNS Suffix SearchList
+```
+
+---
+
+# 🎯 **Summary of All Steps**
+
+1. **Open GPMC** (`gpmc.msc`)
+2. **Create new GPO** (“Fix DNS Suffix SearchList”)
+3. **Edit GPO:**
+
+   * Configure → DNS Suffix Search List
+   * Disable → Primary DNS Suffix Devolution
+4. **Link GPO to the Server OU**
+5. **Move servers into that OU** (ADUC)
+6. **Run gpupdate /force**
+7. **Verify SearchList and GPO applied**
+
+---
+
+If you want, I can also:
+
+* Generate the **GPO Backup XML** you can import directly
+* Create a **diagram** of the GPO flow
+* Write a **Jira-ready description** of this GPO process
+* Give you an **Ansible command** to detect which servers *don’t* have the GPO applied yet
+
+Just say the word.
 
 
+Great question—and this is one where Windows is annoyingly particular.
+
+I can’t give you a **single XML file** you can just paste somewhere and “Import GPO” — GPMC backups are actually a **folder structure** with multiple files (including XML) that GPMC generates itself.
+
+What I *can* do is give you a **PowerShell script** that:
+
+1. Creates the GPO with the **exact DNS settings** we discussed
+2. Backs it up to a folder
+3. That folder is a valid **GPO backup** you can import on any other DC/forest using GPMC (“Manage Backups / Restore”)
+
+---
+
+## 🔧 PowerShell: Create GPO + Backup It (This Produces the XML You Want)
+
+Run this from a domain-joined server/workstation with GPMC/RSAT and appropriate rights:
+
+```powershell
+# ===== CONFIGURE THESE VALUES =====
+$GpoName    = "Fix DNS Suffix SearchList"
+$BackupPath = "C:\GPO-Backups\Fix-DNS-Suffix"
+$SearchList = "corp.example.com"   # <- your domain suffix
+# ==================================
+
+Import-Module GroupPolicy
+
+# 1. Create GPO if it doesn't exist yet
+$gpo = Get-GPO -Name $GpoName -ErrorAction SilentlyContinue
+if (-not $gpo) {
+    Write-Host "Creating new GPO: $GpoName"
+    $gpo = New-GPO -Name $GpoName
+} else {
+    Write-Host "GPO already exists: $GpoName (GUID: $($gpo.Id))"
+}
+
+# 2. Set DNS Suffix Search List via policy registry (DNS Client)
+# This mimics the "DNS Suffix Search List" Admin Template setting
+$policyKey = "HKLM\Software\Policies\Microsoft\Windows NT\DNSClient"
+
+Set-GPRegistryValue -Name $GpoName `
+    -Key $policyKey `
+    -ValueName "SearchList" `
+    -Type String `
+    -Value $SearchList
+
+# 3. Disable DNS devolution (UseDomainNameDevolution = 0)
+Set-GPRegistryValue -Name $GpoName `
+    -Key $policyKey `
+    -ValueName "UseDomainNameDevolution" `
+    -Type DWord `
+    -Value 0
+
+# 4. Create backup folder if needed
+if (-not (Test-Path $BackupPath)) {
+    New-Item -Path $BackupPath -ItemType Directory | Out-Null
+}
+
+# 5. Backup the GPO (this creates the XML + manifest)
+Write-Host "Backing up GPO '$GpoName' to '$BackupPath'..."
+Backup-GPO -Name $GpoName -Path $BackupPath -Comment "Fix DNS suffix search list and disable devolution"
+
+Write-Host "Done. GPO backup created at: $BackupPath"
+```
+
+### What this gives you
+
+* A folder like:
+
+  ```
+  C:\GPO-Backups\Fix-DNS-Suffix\{GPO-GUID-HERE}
+  ```
+* Inside it you’ll see files like:
+
+  * `Backup.xml`
+  * `GPO.xml`
+  * `MACHINE\...`
+* That folder is a **valid GPO backup** as if you’d done “Back Up” from GPMC by hand.
+
+---
+
+## 🧪 How to import this backup on another environment
+
+On the **target domain** (with GPMC):
+
+1. Open **Group Policy Management** (`gpmc.msc`)
+2. Right-click **Group Policy Objects** → **Manage Backups…**
+3. Point it at your backup path (e.g., copied from `C:\GPO-Backups\Fix-DNS-Suffix`)
+4. Select the `Fix DNS Suffix SearchList` backup
+5. Click **Restore…** or **Copy…** as needed
+
+Then link it to your server OU as we described earlier.
+
+---
+
+If you really want, I can also:
+
+* Add to the script: **auto-link the GPO** to a specific OU
+* Or generate a **second script** that takes an existing backup and restores it on another domain automatically.
 
 
 
