@@ -1241,5 +1241,89 @@ If you want, next step I can give you a tiny Ansible play that just **checks** D
 
 
 
+Short answer: **AD itself can’t fix this before the VM joins the domain**, but you *can* use the DC as a **remote PowerShell jump box** to push the same DNS fix to the VM.
+
+So:
+
+* ❌ You **cannot** use GPO / AD to push settings to a VM that isn’t joined yet.
+* ✅ You **can** sit on the DC and use **PowerShell Remoting (WinRM)** to run the DNS-fix script on the VM using the **local admin account** on that VM.
+* ✅ Once the VM *is* joined, then GPO from the DC can keep the DNS suffix list correct long-term.
+
+---
+
+## 1) Remote PowerShell from the DC to the VM (before domain join)
+
+**Prereqs on the VM:**
+
+* WinRM enabled (HTTP 5985 or HTTPS 5986)
+* Firewall allows that port
+* You know a local admin account on the VM (e.g. `.\sms-administrator`)
+
+From the **domain controller** (or any domain-joined admin box), run:
+
+```powershell
+# On the DC (or any admin workstation)
+
+$vmIp      = "10.10.0.25"             # VM IP in SCI
+$cred      = Get-Credential .\sms-administrator
+
+Invoke-Command -ComputerName $vmIp -Credential $cred -ScriptBlock {
+    # --- EDIT THESE FOR YOUR ENV ---
+    $DnsServers = @('10.10.0.10','10.10.0.11')   # AD DNS servers
+    $AdDomain   = 'corp.example.com'            # AD DNS domain
+    # --------------------------------
+
+    Write-Host "Setting DNS servers..."
+    Get-DnsClientAdapter | ForEach-Object {
+        Set-DnsClientServerAddress -InterfaceIndex $_.InterfaceIndex `
+            -ServerAddresses $DnsServers -ErrorAction SilentlyContinue
+    }
+
+    Write-Host "Clearing bad SearchList..."
+    Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+        -Name 'SearchList' -ErrorAction SilentlyContinue
+
+    Write-Host "Setting SearchList to $AdDomain ..."
+    Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+        -Name 'SearchList' -Value $AdDomain
+
+    Write-Host "Disabling DNS devolution..."
+    Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+        -Name 'UseDomainNameDevolution' -Type DWord -Value 0
+}
+```
+
+After that, you can (still on the DC) sanity-check DNS from the VM:
+
+```powershell
+Invoke-Command -ComputerName $vmIp -Credential $cred -ScriptBlock {
+    nslookup corp.example.com
+    nslookup _ldap._tcp.dc._msdcs.corp.example.com
+}
+```
+
+If those resolve to your DCs, you’re ready to run the actual join.
+
+---
+
+## 2) After the VM is joined – AD / GPO from the DC
+
+Once the VM can join and does:
+
+1. Use **GPMC on the DC** to create the `Fix DNS Suffix SearchList` GPO.
+2. Set:
+
+   * `Computer Configuration → Policies → Administrative Templates → Network → DNS Client → DNS Suffix Search List`
+   * `Primary DNS Suffix Devolution` = Disabled
+3. Link that GPO to the OU containing your SCI Windows servers.
+
+From that point on:
+
+* The **DC (via GPO)** keeps the DNS suffix list correct.
+* You only need the remote PowerShell/Cloudbase-Init fix for **initial boot / pre-join**.
+
+---
+
+So: there’s no magic “AD-only” fix for a non-joined VM, but using the DC as your **remote PowerShell control node** is totally valid and might be more comfortable than logging into each VM.
 
 
