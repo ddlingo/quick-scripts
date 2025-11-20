@@ -945,4 +945,301 @@ If you'd like, I can help you:
 ✔ generate a “delegation request” to send to AD team
 ✔ write a GPO permission audit script for your entire environment
 
++++++++++++++++++++++++++++++
+
+
+
+
+
+
+
+
+Thanks for the photo — this confirms **exactly** what’s breaking domain join.
+
+Let’s analyze what you posted.
+
+---
+
+# 🚨 **Critical problem #1 — DNS ServerAddresses are WRONG**
+
+From the screenshot:
+
+```
+InterfaceAlias    ServerAddresses
+--------------    ---------------
+Ethernet...       {10.10.0.2, 10.10.0.3}
+```
+
+Those DNS servers are **SAP/OpenStack infrastructure DNS**, NOT your **Active Directory DNS**.
+
+➡️ This VM will **never** resolve AD SRV records
+➡️ This VM will **never** locate a Domain Controller
+➡️ `nltest`, domain join, LDAP, Kerberos, RPC will always fail
+
+You must override those DNS servers.
+
+---
+
+# 🚨 **Critical problem #2 — SearchList is full of SAP internal suffixes**
+
+From your `reg query`:
+
+```
+SearchList REG_SZ global.cloud.sap,mo.sap.corp,wdc.sap.corp,global.corp.sap
+```
+
+This is **exactly the broken SearchList baked into the SAP Windows image**.
+
+This causes Windows to try suffixes in this order before ever attempting your AD domain.
+
+➡️ Name lookups go to SAP DNS
+➡️ Wrong suffixes cause timeouts
+➡️ DC lookup fails
+➡️ Domain join fails
+
+This must be **completely replaced**.
+
+---
+
+# 🎯 Here are the EXACT commands you need to run on the VM to fix both issues.
+
+## ✅ **1. Replace DNS servers with your AD DNS servers**
+
+*(replace the IPs with your AD DNS)*
+
+```powershell
+Get-DnsClientAdapter | ForEach-Object {
+    Set-DnsClientServerAddress -InterfaceIndex $_.InterfaceIndex `
+      -ServerAddresses @("10.10.0.10","10.10.0.11")
+}
+```
+
+Verify:
+
+```powershell
+Get-DnsClientServerAddress
+```
+
+Expected:
+
+```
+10.10.0.10
+10.10.0.11
+```
+
+---
+
+## ✅ **2. CLEAR the bad SAP SearchList**
+
+```powershell
+Remove-ItemProperty `
+  -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+  -Name 'SearchList' `
+  -ErrorAction SilentlyContinue
+```
+
+---
+
+## ✅ **3. SET your correct AD SearchList**
+
+```powershell
+Set-ItemProperty `
+  -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+  -Name 'SearchList' `
+  -Value 'corp.example.com'
+```
+
+---
+
+## ✅ **4. Disable DNS devolution (required)**
+
+```powershell
+Set-ItemProperty `
+  -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+  -Name 'UseDomainNameDevolution' `
+  -Type DWord `
+  -Value 0
+```
+
+---
+
+# 🔄 Now REBOOT the VM
+
+Since these DNS servers and SearchList were active, a reboot ensures fresh resolver state.
+
+```powershell
+shutdown /r /t 5
+```
+
+---
+
+# 🧪 After reboot — retest DNS (IMPORTANT)
+
+## Test domain name:
+
+```powershell
+nslookup yourdomain.com
+```
+
+## Test AD SRV record:
+
+```powershell
+nslookup _ldap._tcp.dc._msdcs.yourdomain.com
+```
+
+You should now see your domain controllers.
+
+If this works → the VM can join the domain.
+
+---
+
+# 🔥 Final step — safe dry-run domain-join test
+
+```powershell
+Add-Computer -DomainName yourdomain.com -Credential (Get-Credential) -WhatIf
+```
+
+If no errors appear:
+➡️ You **CAN** join
+
+If errors appear:
+➡️ Paste them here and we’ll analyze — but DNS was the root problem.
+
+---
+
+# 🎯 Summary of what the screenshot showed
+
+✔ Wrong DNS servers (`10.10.0.2`, `10.10.0.3`)
+✔ Wrong search suffix list (SAP suffixes)
+✔ VM cannot resolve AD → cannot join domain
+✔ Fix is to override DNS + SearchList
+
+---
+
+If you want, I can generate a **single PowerShell script** that completely fixes DNS + SearchList + devolution + reboot, so you can paste it in one shot (or use it in Cloudbase-Init).
+
+
+
+
+
+
+++++++++++++++++++++++++++++++++
+===============================
+
+
+Got you. Let’s keep this tight and practical: one script you can paste into PowerShell on the VM, and one Cloudbase-Init user-data block.
+
+---
+
+## 1) PowerShell script to run **on the VM**
+
+> Run this in an **elevated PowerShell** session on the Windows VM.
+> Replace the DNS IPs and domain with your real values.
+
+```powershell
+# --- EDIT THESE VALUES FOR YOUR ENVIRONMENT ---
+$DnsServers = @('10.10.0.10', '10.10.0.11')   # <-- AD DNS servers
+$AdDomain   = 'corp.example.com'              # <-- Your AD DNS domain
+# ---------------------------------------------
+
+Write-Host "Setting DNS servers on all adapters..."
+Get-DnsClientAdapter | ForEach-Object {
+    try {
+        Set-DnsClientServerAddress -InterfaceIndex $_.InterfaceIndex `
+            -ServerAddresses $DnsServers -ErrorAction Stop
+        Write-Host "  OK: $_.InterfaceAlias"
+    } catch {
+        Write-Warning "  Failed on adapter $($_.InterfaceAlias): $($_.Exception.Message)"
+    }
+}
+
+Write-Host "Clearing existing DNS SearchList..."
+Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+    -Name 'SearchList' -ErrorAction SilentlyContinue
+
+Write-Host "Setting DNS SearchList to $AdDomain ..."
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+    -Name 'SearchList' -Value $AdDomain
+
+Write-Host "Disabling DNS devolution..."
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+    -Name 'UseDomainNameDevolution' -Type DWord -Value 0
+
+Write-Host "`nCurrent DNS server addresses:"
+Get-DnsClientServerAddress | Format-Table -AutoSize
+
+Write-Host "`nCurrent SearchList value:"
+reg query HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters /v SearchList
+
+Write-Host "`nDNS settings applied. A reboot is recommended before domain join."
+# Uncomment this line if you want the script to auto-reboot:
+# shutdown.exe /r /t 5 /c "Rebooting to apply DNS changes"
+```
+
+After running and (optionally) rebooting:
+
+```powershell
+nslookup yourdomain.com
+nslookup _ldap._tcp.dc._msdcs.yourdomain.com
+```
+
+If both resolve, you’re ready to `Add-Computer` / Ansible join.
+
+---
+
+## 2) Cloudbase-Init **user-data** (`#ps1`) for deployment
+
+> Paste this into the **User Data** field when creating the VM in SAP SCI.
+> Same idea: set DNS servers, clear bad SearchList, set your domain, disable devolution.
+
+```powershell
+#ps1
+# --- EDIT THESE VALUES FOR YOUR ENVIRONMENT ---
+$DnsServers = @('10.10.0.10', '10.10.0.11')   # AD DNS servers
+$AdDomain   = 'corp.example.com'              # AD DNS domain
+# ---------------------------------------------
+
+Write-Host "Cloudbase-Init: configuring DNS servers..."
+Get-DnsClientAdapter | ForEach-Object {
+    try {
+        Set-DnsClientServerAddress -InterfaceIndex $_.InterfaceIndex `
+            -ServerAddresses $DnsServers -ErrorAction Stop
+    } catch {
+        Write-Warning "Failed to set DNS on adapter $($_.InterfaceAlias): $($_.Exception.Message)"
+    }
+}
+
+Write-Host "Cloudbase-Init: clearing existing DNS SearchList..."
+Remove-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+    -Name 'SearchList' -ErrorAction SilentlyContinue
+
+Write-Host "Cloudbase-Init: setting DNS SearchList to $AdDomain ..."
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+    -Name 'SearchList' -Value $AdDomain
+
+Write-Host "Cloudbase-Init: disabling DNS devolution..."
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+    -Name 'UseDomainNameDevolution' -Type DWord -Value 0
+
+Write-Host "Cloudbase-Init: DNS configuration complete."
+
+# For first-boot via Cloudbase-Init, you typically don't *need* a reboot.
+# If you want to force one anyway, uncomment:
+# shutdown.exe /r /t 5 /c "Rebooting after DNS configuration"
+```
+
+That’s it:
+
+* Use the **PowerShell script** on existing VMs to fix them.
+* Use the **Cloudbase-Init block** on *new* VMs so they come up with correct DNS from first boot.
+
+If you want, next step I can give you a tiny Ansible play that just **checks** DNS servers + SearchList on all SCI Windows VMs so you can see which ones are still using the SAP defaults.
+
+
+
+
+
+
+
+
 
