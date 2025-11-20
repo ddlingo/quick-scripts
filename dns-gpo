@@ -1326,4 +1326,301 @@ From that point on:
 
 So: there’s no magic “AD-only” fix for a non-joined VM, but using the DC as your **remote PowerShell control node** is totally valid and might be more comfortable than logging into each VM.
 
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>Got it — and yes, I see exactly what your AD teammate (Andre) is suggesting.
+
+Let’s break this down cleanly so you know **when you should and should NOT use this command**, and whether it applies in your situation.
+
+---
+
+# 🔍 **The command from Andre:**
+
+```
+Add-Computer -Credential (Get-Credential) `
+  -Options 'JoinWithNewName,AccountCreate' `
+  -DomainName 'directory.sci-dev.scs.internal' `
+  -NewName 'new-name'
+```
+
+And he noted:
+
+> “NewName value is the new hostname… I think you can do this without it.”
+
+---
+
+# ✅ **What this command does**
+
+This command attempts a domain join **AND** attempts to:
+
+* **Create a new computer object in AD** (AccountCreate)
+* Optionally **rename the computer** during the join (JoinWithNewName)
+
+This requires:
+
+### **1. AD permission to create computer objects**
+
+OR
+
+### **2. The computer object already exists in AD**
+
+AND
+
+### **3. DNS must already be correct**
+
+* Correct DNS servers
+* Correct SearchList
+* Can resolve `_ldap._tcp.dc._msdcs.<domain>`
+
+---
+
+# ❗ **BUT — you are NOT ready to run this yet**
+
+You still have:
+
+* ❌ Wrong DNS servers
+* ❌ Wrong DNS SearchList
+* ❌ Missing AD DNS resolution
+
+Until DNS is fixed:
+
+*No domain join command will ever work*, including Andre’s.
+
+This is why:
+
+```
+nltest /sc_query
+RPC_S_Server_UNAVAILABLE
+```
+
+You must fix DNS **first**.
+
+---
+
+# 🔥 **Which flags should you use when DNS is fixed?**
+
+You do **NOT** need the `NewName` option unless you want to *rename the VM* as part of the join.
+
+### If you do NOT want to rename:
+
+Use the simplest form:
+
+```powershell
+Add-Computer -DomainName 'directory.sci-dev.scs.internal' -Credential (Get-Credential)
+```
+
+### If you WANT to rename the computer during join:
+
+```powershell
+Rename-Computer -NewName "new-name" -Restart
+Add-Computer -DomainName 'directory.sci-dev.scs.internal' -Credential (Get-Credential)
+```
+
+### If you want AD to **create the computer object** automatically:
+
+```powershell
+Add-Computer -DomainName 'directory.sci-dev.scs.internal' `
+  -Credential (Get-Credential) `
+  -Options AccountCreate
+```
+
+---
+
+# 🤝 **Your actual next steps (very clear):**
+
+## **1. Fix DNS servers**
+
+Replace with your AD DNS IP addresses:
+
+```powershell
+Get-DnsClientAdapter | ForEach-Object {
+    Set-DnsClientServerAddress -InterfaceIndex $_.InterfaceIndex `
+    -ServerAddresses @("10.x.x.x","10.x.x.y")
+}
+```
+
+Verify:
+
+```powershell
+Get-DnsClientServerAddress
+```
+
+---
+
+## **2. Fix DNS SearchList**
+
+Remove SAP’s garbage suffixes:
+
+```powershell
+Remove-ItemProperty `
+ 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+ -Name 'SearchList' -ErrorAction SilentlyContinue
+```
+
+Add your correct AD domain:
+
+```powershell
+Set-ItemProperty `
+ 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+ -Name 'SearchList' -Value 'directory.sci-dev.scs.internal'
+```
+
+Disable devolution:
+
+```powershell
+Set-ItemProperty `
+ 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+ -Name 'UseDomainNameDevolution' `
+ -Type DWord -Value 0
+```
+
+---
+
+## **3. Test DNS resolution**
+
+These **must work**, or domain join will still fail:
+
+```powershell
+nslookup directory.sci-dev.scs.internal
+```
+
+```powershell
+nslookup _ldap._tcp.dc._msdcs.directory.sci-dev.scs.internal
+```
+
+If these fail → don’t bother trying to join.
+
+---
+
+## **4. JOIN the domain using a safe test**
+
+Before actually joining, simulate the join:
+
+```powershell
+Add-Computer -DomainName 'directory.sci-dev.scs.internal' `
+  -Credential (Get-Credential) `
+  -WhatIf
+```
+
+If that looks good → run the real join:
+
+```powershell
+Add-Computer -DomainName 'directory.sci-dev.scs.internal' -Credential (Get-Credential)
+Restart-Computer
+```
+
+---
+
+# 🎯 **BOTTOM LINE**
+
+Andre’s command is correct in principle,
+BUT **DNS MUST BE FIXED FIRST** — otherwise *any* join method will fail.
+
+Once DNS is fixed, you can use:
+
+✔ `Add-Computer` (simple join)
+✔ `Add-Computer -Options AccountCreate` (auto-create computer object)
+✔ `Add-Computer -NewName` (rename + join)
+
+---
+
+If you want, paste the AD DNS server IPs you were given, and I’ll generate the exact commands you should run for your environment.
+
+>>>>>>>>>>>>>>>
+Cool, let’s lock this in with something you can *actually* paste and run.
+Since I don’t know your exact AD DNS IPs, I’ll use placeholders – you just plug yours in.
+
+I’ll assume your AD domain is:
+`directory.sci-dev.scs.internal` (from your screenshot)
+
+---
+
+## 1️⃣ Fix DNS + search list on the VM (run as **Administrator**)
+
+Open an elevated PowerShell on the VM and paste this whole block:
+
+```powershell
+# --- EDIT THESE TWO LINES ONLY ---
+$Domain     = 'directory.sci-dev.scs.internal'
+$DnsServers = @('10.20.30.40','10.20.30.41')   # <-- PUT YOUR AD DNS IPs HERE
+# ---------------------------------
+
+Write-Host "Setting DNS servers on all adapters to $($DnsServers -join ', ') ..."
+Get-DnsClientAdapter | ForEach-Object {
+    Set-DnsClientServerAddress -InterfaceIndex $_.InterfaceIndex `
+        -ServerAddresses $DnsServers
+}
+
+Write-Host "Clearing any existing DNS SearchList..."
+Remove-ItemProperty `
+  -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+  -Name 'SearchList' -ErrorAction SilentlyContinue
+
+Write-Host "Setting DNS SearchList to $Domain ..."
+Set-ItemProperty `
+  -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+  -Name 'SearchList' `
+  -Value $Domain
+
+Write-Host "Disabling DNS devolution..."
+Set-ItemProperty `
+  -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+  -Name 'UseDomainNameDevolution' `
+  -Type DWord `
+  -Value 0
+
+Write-Host "Current DNS servers:"
+Get-DnsClientServerAddress | Format-Table -AutoSize
+
+Write-Host "Current global TCP/IP SearchList:"
+reg query HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters /v SearchList
+```
+
+Check that:
+
+* `Get-DnsClientServerAddress` shows **only** your AD DNS servers.
+* `SearchList` now shows just `directory.sci-dev.scs.internal`.
+
+---
+
+## 2️⃣ Test DNS resolution to AD
+
+Still on the VM, run:
+
+```powershell
+nslookup $Domain
+nslookup _ldap._tcp.dc._msdcs.$Domain
+```
+
+Both should return info about your domain / DCs (no timeouts).
+
+If either fails, don’t try to join yet – DNS still isn’t right.
+
+---
+
+## 3️⃣ Safe “dry run” join test
+
+Once DNS looks good:
+
+```powershell
+Add-Computer -DomainName $Domain -Credential (Get-Credential) -WhatIf
+```
+
+* If it prints what it *would* do → your creds and DNS are good.
+* If it errors → we read that error and fix whatever it says.
+
+---
+
+## 4️⃣ Actual domain join
+
+When the `-WhatIf` looks clean, do the real join:
+
+```powershell
+Add-Computer -DomainName $Domain -Credential (Get-Credential)
+Restart-Computer
+```
+
+That’s it – this is the exact flow you need on the VM.
+
+---
+
+If you send me your actual AD DNS IPs (or a `Get-DnsClientServerAddress` after you set them), I can swap them into this block so you’ve got a perfectly customized snippet you can just paste.
 
