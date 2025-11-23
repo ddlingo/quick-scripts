@@ -1,0 +1,72 @@
+[windows]
+sapwin01 ansible_host=REPLACE_WITH_VM_IP
+
+[windows:vars]
+ansible_user=Administrator
+ansible_password=REPLACE_WITH_ADMIN_PASSWORD
+ansible_connection=winrm
+ansible_winrm_transport=ntlm
+ansible_winrm_scheme=https
+ansible_winrm_server_cert_validation=ignore
+ansible_port=5986
+
+==============================
+
+---
+- name: Fix DNS Configuration on Windows Servers
+  hosts: windows
+  gather_facts: no
+  vars:
+    sci_ad_dns_domain: "directory.sci-dev.scs.internal"  # EDIT THIS VALUE
+    sci_ad_dns_servers:
+      - "10.20.30.40"  # EDIT THIS VALUE
+      - "10.20.30.41"  # EDIT THIS VALUE
+
+  tasks:
+    - name: Set DNS servers for all adapters
+      ansible.windows.win_dns_client:
+        adapter_names: []
+        dns_servers: "{{ sci_ad_dns_servers }}"
+      register: dns_client_result
+
+    - name: Remove existing SearchList in registry
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters
+        name: SearchList
+        state: absent
+
+    - name: Set new SearchList in registry
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters
+        name: SearchList
+        datatype: string
+        value: "{{ sci_ad_dns_domain }}"
+        state: present
+
+    - name: Disable UseDomainNameDevolution
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters
+        name: UseDomainNameDevolution
+        datatype: dword
+        value: 0  # Set to false
+        state: present
+
+    - name: Verify DNS server settings
+      ansible.windows.win_shell: |
+        Get-DnsClientServerAddress | Format-Table -AutoSize
+      register: dns_check
+    - name: Debug DNS server settings
+      debug:
+        var: dns_check.stdout_lines
+
+    - name: Verify registry SearchList
+      ansible.windows.win_shell: |
+        reg query HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters /v SearchList
+      register: searchlist_check
+    - name: Debug registry SearchList
+      debug:
+        var: searchlist_check.stdout_lines
+
+
+
+
